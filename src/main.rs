@@ -1,7 +1,7 @@
 //! AniCraft desktop app.
 //!
 //! ```text
-//! anicraft [file.anicraft] [--screenshot out.png] [--renderer wgpu|gl] [--open <panel>]
+//! anicraft [file.anicraft] [--control <port>] [--screenshot out.png] [--renderer wgpu|gl] [--open <panel>]
 //!          [--theme dark|light|high-contrast] [--scale <percent>] [--lang <code>|auto|pseudo]
 //! anicraft --version
 //! ```
@@ -52,6 +52,12 @@ mod icons;
 mod keymap;
 mod library;
 mod menus;
+#[cfg(not(target_arch = "wasm32"))]
+mod remote;
+#[cfg(not(target_arch = "wasm32"))]
+mod freeze_diag;
+#[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+mod python;
 #[cfg(not(target_arch = "wasm32"))]
 mod updates;
 mod mixed;
@@ -138,7 +144,7 @@ struct Look {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn run(attempt: startup::Attempt, file: Option<&Path>, shot: Option<PathBuf>, open: Option<String>, look: Look) -> eframe::Result {
+fn run(attempt: startup::Attempt, file: Option<&Path>, shot: Option<PathBuf>, open: Option<String>, look: Look, control: Option<u16>) -> eframe::Result {
     let options = attempt.options(eframe::NativeOptions {
         viewport: platform::viewport(egui::ViewportBuilder::default().with_title("AniCraft").with_inner_size([1600.0, 940.0]).with_min_inner_size([960.0, 600.0])),
         ..Default::default()
@@ -159,6 +165,11 @@ fn run(attempt: startup::Attempt, file: Option<&Path>, shot: Option<PathBuf>, op
             startup::log_adapter(cc.wgpu_render_state.as_ref());
             let starting_fresh = file_given.is_none() && shot.is_none();
             let mut a = app::App::new(cc, session, shot);
+            if let Some(port) = control {
+                if let Err(error) = a.remote.activate(port, cc.egui_ctx.clone()) {
+                    a.status_err(format!("API Control could not start on 127.0.0.1:{port}: {error}"));
+                }
+            }
             if let Some(s) = a.shot.as_mut() {
                 s.width = look.shot_width;
             }
@@ -199,6 +210,7 @@ struct Args {
     file: Option<PathBuf>,
     open: Option<String>,
     renderer: Option<String>,
+    control: Option<u16>,
     look: Look,
     /// `--version` / `--help`: print and leave.
     print: Option<Print>,
@@ -211,6 +223,13 @@ enum Print {
     Help,
 }
 
+/// The local API listener never uses port 0 (an unspecified ephemeral port).
+#[cfg(not(target_arch = "wasm32"))]
+fn control_port(value: &str) -> Result<u16, String> {
+    value.parse::<u16>().ok().filter(|p| *p != 0)
+        .ok_or_else(|| format!("--control needs a port number from 1 to 65535, not `{value}`"))
+}
+
 /// Reads the arguments (without the program name). `Err` is the message for a bad one.
 #[cfg(not(target_arch = "wasm32"))]
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -221,6 +240,15 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--screenshot" => out.shot = Some(PathBuf::from(args.next().ok_or("--screenshot needs a file name")?)), // i18n-exempt: a console message
             "--open" => out.open = args.next(),
             "--renderer" => out.renderer = args.next(),
+            "--control" => {
+                if out.control.is_some() { return Err("--control given twice".into()); }
+                let value = args.next().ok_or("--control needs a port number from 1 to 65535")?;
+                out.control = Some(control_port(&value)?);
+            },
+            other if other.starts_with("--control=") => {
+                if out.control.is_some() { return Err("--control given twice".into()); }
+                out.control = Some(control_port(&other["--control=".len()..])?);
+            },
             "--shot-width" => match args.next().and_then(|s| s.parse::<u32>().ok()) {
                 Some(w) if (64..=8192).contains(&w) => out.look.shot_width = Some(w),
                 _ => return Err("--shot-width takes a width in pixels, from 64 to 8192".into()), // i18n-exempt: a console message
@@ -256,7 +284,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
 /// `--help` (the console's text, in English).
 #[cfg(not(target_arch = "wasm32"))]
 // i18n-exempt: the --help console text
-const HELP: &str = "anicraft [file.anicraft|file.fla|file.xfl] [--version] [--screenshot out.png [--shot-width <px>]] [--renderer gl|wgpu|vulkan|dx12|metal] [--theme graphite|high-contrast] [--scale <percent>] [--lang <code>|auto|pseudo] [--open palette|shortcuts|lastscene|start|drop|droplibrary|select|selectzoom|about|files|confirm|transform|points|merge|rawparts|rawedit|rawsub|rawpoints|rawsnap|rulers|editguides|editgrid|symboledit|groups|combine|nineslice|nineslicedit|brush|brushing|polystar|paintinside|drawingedit|shapeenvelope|brushlibrary|brushcurve|paintbrush|eraser|erasing|eyedropper|pen|frames|span|bucket|tlzoom|tlwide|motion|motionspan|motionpath|motionpoints|motionedit|motionpins|motionpinsspan|hints|hintsend|camera|cameraview|bones|springbones|shapebones|layerdepth|layerdepthview|filters|strokes|prefs|licenses|zoom|recovery|plugins|actions|script|scriptproblems|testmovie|testmovieinside|testscript|textfields|testtext|softmask|pathtext|button|testhits|exporthtml|publish|publishreport|publishanim|sound|envelope|ease|easepreset|library|librarymenu|colour|layerprops|frameview|layercolour|timelinepolish|dock|animator|designer|gradient|gradientbucket|swatches|swatchpanel]\n\
+const HELP: &str = "anicraft [file.anicraft|file.fla|file.xfl] [--control <port>] [--version] [--screenshot out.png [--shot-width <px>]] [--renderer gl|wgpu|vulkan|dx12|metal] [--theme graphite|high-contrast] [--scale <percent>] [--lang <code>|auto|pseudo] [--open palette|shortcuts|lastscene|start|drop|droplibrary|select|selectzoom|about|files|confirm|transform|points|merge|rawparts|rawedit|rawsub|rawpoints|rawsnap|rulers|editguides|editgrid|symboledit|groups|combine|nineslice|nineslicedit|brush|brushing|polystar|paintinside|drawingedit|shapeenvelope|brushlibrary|brushcurve|paintbrush|eraser|erasing|eyedropper|pen|frames|span|bucket|tlzoom|tlwide|motion|motionspan|motionpath|motionpoints|motionedit|motionpins|motionpinsspan|hints|hintsend|camera|cameraview|bones|springbones|shapebones|layerdepth|layerdepthview|filters|strokes|prefs|licenses|zoom|recovery|plugins|actions|script|scriptproblems|testmovie|testmovieinside|testscript|textfields|testtext|softmask|pathtext|button|testhits|exporthtml|publish|publishreport|publishanim|sound|envelope|ease|easepreset|library|librarymenu|colour|layerprops|frameview|layercolour|timelinepolish|dock|animator|designer|gradient|gradientbucket|swatches|swatchpanel]\n\
+     --control    enable localhost API Control at startup (port 1..65535, e.g. 7980)\n\
      --renderer   the window's graphics (also ANICRAFT_RENDERER); default automatic, falling back to OpenGL\n\
      --open       shows a panel at start (handy with --screenshot for visual checks)\n\
      --shot-width scales the screenshot down to this width (the user guide's pictures)\n\
@@ -293,7 +322,7 @@ fn main() -> eframe::Result {
         }
         None => {}
     }
-    let Args { shot, file, open, renderer, look, .. } = args;
+    let Args { shot, file, open, renderer, look, control, .. } = args;
     // macOS hands documents over as Apple Events, the one that launched the app included: listen
     // from before the event loop starts until it ends (ADR 0062).
     let _documents = platform::listen_for_documents();
@@ -306,7 +335,7 @@ fn main() -> eframe::Result {
     let mut why = String::from("no attempt"); // i18n-exempt: log text
     for (n, attempt) in attempts.iter().enumerate() {
         startup::trying(attempt, n + 1, attempts.len());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(*attempt, file.as_deref(), shot.clone(), open.clone(), look.clone())));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(*attempt, file.as_deref(), shot.clone(), open.clone(), look.clone(), control)));
         why = match result {
             Ok(Ok(())) => {
                 startup::line("closed");
@@ -350,6 +379,11 @@ mod args_tests {
         assert_eq!(parse(&["--screenshot", "a.png", "--shot-width", "1200"]).look.shot_width, Some(1200));
         assert!(parse_args(["--shot-width".to_string(), "9".to_string()]).is_err());
         assert_eq!(parse(&["--version"]).print, Some(Print::Version));
+        assert_eq!(parse(&["--control", "7980"]).control, Some(7980));
+        assert_eq!(parse(&["--control=7980"]).control, Some(7980));
+        for params in [vec!["--control"], vec!["--control", "0"], vec!["--control=65536"], vec!["--control", "abc"], vec!["--control", "7980", "--control", "7979"]] {
+            assert!(parse_args(params.iter().map(|s| (*s).to_string())).is_err(), "{params:?}");
+        }
         // And the file opens: the session starts with it, not the sample.
         let dir = std::env::temp_dir().join(format!("anicraft-shell-args-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

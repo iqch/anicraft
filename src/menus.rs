@@ -12,11 +12,12 @@ pub(crate) const TOP_MENUS: [&str; 9] = [tr_noop!("File"), tr_noop!("Edit"), tr_
 pub fn bar(app: &mut App, ui: &mut egui::Ui) {
     let cmds = commands();
     let ctx = ui.ctx().clone();
+    let top_names = top_names();
     let labels = top_labels();
     let keys = access_keys(&labels.iter().map(String::as_str).collect::<Vec<_>>());
     app.menu_keys.before(&ctx);
     let underline = app.menu_keys.show_keys;
-    let mut tops = Vec::with_capacity(TOP_MENUS.len());
+    let mut tops = Vec::with_capacity(top_names.len());
     egui::MenuBar::new().ui(ui, |ui| {
         // macOS: leave room for the traffic lights over the unified title bar.
         ui.add_space(platform::menu_inset());
@@ -38,8 +39,12 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
             });
         }
         // Windows and Linux: no name before the menus; the window title already shows it.
-        for ((top, label), key) in TOP_MENUS.into_iter().zip(&labels).zip(&keys) {
-            let title = if underline { egui::WidgetText::from(crate::theme::access_key_label(label, key.map(|(i, _)| i))) } else { egui::WidgetText::from(label.as_str()) };
+        for ((top, label), key) in top_names.iter().zip(&labels).zip(&keys) {
+            #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+            let displayed = crate::python::root_label(top, label);
+            #[cfg(not(all(feature = "python", not(target_arch = "wasm32"))))]
+            let displayed = label.clone();
+            let title = if underline { egui::WidgetText::from(crate::theme::access_key_label(&displayed, key.map(|(i, _)| i))) } else { egui::WidgetText::from(displayed.as_str()) };
             let r = ui.menu_button(title, |ui| {
                 ui.set_min_width(230.0);
                 // The menu's own area, which egui leaves anonymous: a menu named by its title.
@@ -47,8 +52,12 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                     n.set_role(egui::accesskit::Role::Menu);
                     n.set_label(label.as_str());
                 });
-                menu_contents(app, ui, top, &cmds);
+                if TOP_MENUS.contains(&top.as_str()) { menu_contents(app, ui, top, &cmds); }
+                #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+                crate::python::menu_contents(app, ui, top);
             });
+            #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+            crate::python::decorate_root(ui, &r.response, top);
             if let Some((_, c)) = key
                 && MenuKeys::available()
             {
@@ -57,13 +66,30 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
             }
             tops.push(r.response.id);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                crate::remote::button(app, ui);
+            });
+        }
     });
     app.menu_keys.after(&ctx, tops);
 }
 
 /// The top menus' titles in the interface language.
+fn top_names() -> Vec<String> {
+    let mut tops: Vec<String> = TOP_MENUS.iter().map(|s| (*s).to_string()).collect();
+    #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+    for (title, before) in crate::python::roots() {
+        if tops.contains(&title) { continue; }
+        let at = tops.iter().position(|v| v == &before).unwrap_or(tops.len());
+        tops.insert(at, title);
+    }
+    tops
+}
+
 fn top_labels() -> Vec<String> {
-    TOP_MENUS.iter().map(|t| crate::i18n::t(t).to_string()).collect()
+    top_names().into_iter().map(|name| if TOP_MENUS.contains(&name.as_str()) { crate::i18n::t_dyn(&name).into_owned() } else { name }).collect()
 }
 
 /// Each top menu's access key: `(character index, letter)`, the first letter of its title that

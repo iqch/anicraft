@@ -758,6 +758,19 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 menus::cmd_item(app, ui, id);
             }
             ui.separator();
+            if ui.button(tr!("Duplicate Layer")).clicked() {
+                app.run("layer.duplicate", json!({"layer": layer.id.0}));
+                ui.close();
+            }
+            if ui.button(tr!("Copy Layer")).clicked() {
+                app.run("layer.copy", json!({"layer": layer.id.0}));
+                ui.close();
+            }
+            if ui.add_enabled(app.s.layer_clipboard.is_some(), egui::Button::new(tr!("Paste Layer"))).clicked() {
+                app.run("layer.paste", json!({"layer": layer.id.0}));
+                ui.close();
+            }
+            ui.separator();
             for id in ["layer.toggle_visible", "layer.toggle_lock", "layer.toggle_outline"] {
                 menus::cmd_item(app, ui, id);
             }
@@ -1386,6 +1399,17 @@ fn frame_view_button(app: &mut App, ui: &mut egui::Ui) {
             }
         }
         ui.separator();
+        if app.s.editing.is_empty() {
+            ui.label("Scene duration (frames; 0 = auto)");
+            let current = app.s.doc.scenes.get(app.s.scene).map_or(0, |s| s.duration_frames);
+            let mut duration = current;
+            if ui.add(egui::DragValue::new(&mut duration).range(0..=anicraft_engine::MAX_FRAME)).changed() {
+                if let Err(error) = app.s.execute("scene.set_duration", &serde_json::json!({"frames": duration})) {
+                    app.status_err(error.to_string());
+                }
+            }
+            ui.separator();
+        }
         if menus::check_item(ui, tr!("Short"), app.prefs.timeline_short_rows, true) {
             let mut p = app.prefs.clone();
             p.timeline_short_rows = !p.timeline_short_rows;

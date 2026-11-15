@@ -81,6 +81,7 @@ repository.workspace = true
 default-run = "anicraft"
 
 [features]
+python = ["dep:pyo3"]
 # Plays sound during stage playback. Off: playback is silent (for builders without ALSA headers).
 default = ["sound-output", "gpu-stage"]
 sound-output = ["dep:cpal"]
@@ -105,6 +106,7 @@ serde.workspace = true
 fontdb.workspace = true
 anicraft-audio.workspace = true
 serde_json.workspace = true
+png.workspace = true
 web-time.workspace = true
 # The system's interface language, for the default language (ADR 0040; MIT OR Apache-2.0).
 sys-locale = "0.3"
@@ -118,6 +120,7 @@ eframe = { workspace = true, features = ["links"] }
 rfd.workspace = true
 # Sound output (Apache-2.0): WASAPI on Windows, CoreAudio on macOS, ALSA on Linux and the BSDs.
 cpal = { version = "0.18", optional = true }
+pyo3 = { version = "=0.27.2", optional = true, features = ["auto-initialize"] }
 
 # macOS hands a double-clicked document to the app as an Apple Event, which winit 0.30 doesn't
 # deliver (ADR 0062). This small crate (MIT OR Apache-2.0, ~170 lines, read in full) registers the

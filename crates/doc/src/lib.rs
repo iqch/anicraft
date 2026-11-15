@@ -72,6 +72,16 @@ impl Rgba {
     pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
         Rgba { r, g, b, a }
     }
+    /// Default colour of a newly-created stage; invalid values fall back to white.
+    /// Hex values may be written as #RRGGBB, RRGGBB or 0xRRGGBB.
+    pub fn default_stage_color() -> Self {
+        let Ok(raw) = std::env::var("ANICRAFT_DEFAULT_STAGE_COLOR") else { return Self::WHITE };
+        let raw = raw.trim().trim_start_matches('#');
+        let raw = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")).unwrap_or(raw);
+        if raw.len() != 6 || !raw.bytes().all(|c| c.is_ascii_hexdigit()) { return Self::WHITE; }
+        u32::from_str_radix(raw, 16).map_or(Self::WHITE, Self::hex)
+    }
+
     /// From `0xRRGGBB`.
     pub fn hex(rgb: u32) -> Self {
         Rgba::new(((rgb >> 16) & 0xff) as f32 / 255.0, ((rgb >> 8) & 0xff) as f32 / 255.0, (rgb & 0xff) as f32 / 255.0, 1.0)
@@ -1181,11 +1191,35 @@ pub enum LayerKind {
 /// Deepest nesting of folders (and a mask inside them) that is kept.
 pub const MAX_LAYER_DEPTH: usize = 16;
 
+/// How a layer behaves before its first or after its last authored frame.
+/// `Hold` freezes internal symbol time at the boundary, while `Continue` allows it to
+/// advance with the scene clock. Neither mode fills gaps between internal keyframes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutsideFrameMode {
+    #[default]
+    Off,
+    Hold,
+    Continue,
+}
+
+impl OutsideFrameMode {
+    pub const ALL: [OutsideFrameMode; 3] = [OutsideFrameMode::Off, OutsideFrameMode::Hold, OutsideFrameMode::Continue];
+    pub fn is_off(&self) -> bool { *self == Self::Off }
+    pub fn key(self) -> &'static str {
+        match self { Self::Off => "off", Self::Hold => "hold", Self::Continue => "continue" }
+    }
+    pub fn from_key(key: &str) -> Option<Self> { Self::ALL.into_iter().find(|value| value.key() == key) }
+}
+
 /// A timeline layer. Keyframes are `Arc`-shared (see [`Keyframe`]).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Layer {
     pub id: LayerId,
     pub name: String,
+    /// Per-layer notes, saved with the movie.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
     #[serde(default)]
     pub kind: LayerKind,
     /// The folder this layer is in, or the mask layer it is masked by. A layer sits below its
@@ -1195,6 +1229,13 @@ pub struct Layer {
     pub parent: Option<LayerId>,
     #[serde(default = "yes")]
     pub visible: bool,
+    /// Outside the first keyed frame: hidden, frozen, or visible with running symbols.
+    /// Gaps between authored keyframes are never filled.
+    #[serde(default, skip_serializing_if = "OutsideFrameMode::is_off")]
+    pub pre_visibility: OutsideFrameMode,
+    /// Outside the last keyed frame: hidden, frozen, or visible with running symbols.
+    #[serde(default, skip_serializing_if = "OutsideFrameMode::is_off")]
+    pub post_visibility: OutsideFrameMode,
     #[serde(default)]
     pub locked: bool,
     /// View as Outlines (ADR 0061): the stage draws the layer's artwork as hairlines in
@@ -1313,9 +1354,12 @@ impl PartialEq for Layer {
     fn eq(&self, o: &Layer) -> bool {
         self.id == o.id
             && self.name == o.name
+            && self.description == o.description
             && self.kind == o.kind
             && self.parent == o.parent
             && self.visible == o.visible
+            && self.pre_visibility == o.pre_visibility
+            && self.post_visibility == o.post_visibility
             && self.locked == o.locked
             && self.outline == o.outline
             && self.color == o.color
@@ -1347,9 +1391,12 @@ impl Layer {
         Layer {
             id,
             name: name.into(),
+            description: String::new(),
             kind: LayerKind::Normal,
             parent: None,
             visible: true,
+            pre_visibility: OutsideFrameMode::Off,
+            post_visibility: OutsideFrameMode::Off,
             locked: false,
             outline: false,
             color: default_layer_color(),
@@ -1396,6 +1443,30 @@ impl Layer {
     }
     pub fn keyframe_at(&self, frame: u32) -> Option<&Keyframe> {
         self.keyframe_index_at(frame).and_then(|i| self.keyframes.get(i)).map(|k| &**k)
+    }
+    /// The authored frame whose artwork is shown. Empty layers and internal keyframe gaps
+    /// never show artwork. Outside the authored range the first/last frame is sampled
+    /// when the respective mode is Hold or Continue. Editing still needs a real keyframe.
+    pub fn displayed_frame(&self, frame: u32) -> Option<u32> {
+        if self.keyframe_index_at(frame).is_some() {
+            return Some(frame);
+        }
+        let first = self.keyframes.first()?;
+        if frame < first.start {
+            return (self.pre_visibility != OutsideFrameMode::Off).then_some(first.start);
+        }
+        let last = self.keyframes.last()?;
+        if frame >= last.end() {
+            return (self.post_visibility != OutsideFrameMode::Off).then_some(last.end().saturating_sub(1));
+        }
+        None
+    }
+    /// Clock used by the nested symbol instances. In Hold the artwork and its internal
+    /// animation both freeze at the boundary; Continue retains the scene's actual time.
+    pub fn display_clock(&self, frame: u32) -> Option<u32> {
+        let sampled = self.displayed_frame(frame)?;
+        let mode = if frame < sampled { self.pre_visibility } else if frame > sampled { self.post_visibility } else { OutsideFrameMode::Continue };
+        Some(if mode == OutsideFrameMode::Hold { sampled } else { frame })
     }
     /// Index of the keyframe starting exactly at `frame`.
     pub fn keyframe_starting_at(&self, frame: u32) -> Option<usize> {
@@ -1713,7 +1784,7 @@ pub struct Stage {
 
 impl Default for Stage {
     fn default() -> Self {
-        Stage { width: 1280, height: 720, fps: 24.0, background: Rgba::WHITE }
+        Stage { width: 1280, height: 720, fps: 24.0, background: Rgba::default_stage_color() }
     }
 }
 
@@ -1724,6 +1795,13 @@ pub const MAX_STAGE_EDGE: u32 = 16_384;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
     pub name: String,
+    /// Scene-level text notes, independent from every layer.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Minimum playable/exportable duration, independent of the last layer's keyed frame.
+    /// Zero keeps legacy automatic length from the timeline. It never truncates keyed data.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub duration_frames: u32,
     #[serde(default)]
     pub timeline: Timeline,
     /// The scene's guides (View › Guides, ADR 0076), in stage pixels. Animate keeps guides per
@@ -1732,9 +1810,16 @@ pub struct Scene {
     pub guides: Vec<Guide>,
 }
 
+fn is_zero_u32(value: &u32) -> bool { *value == 0 }
+
 impl Scene {
     pub fn new(name: impl Into<String>) -> Scene {
-        Scene { name: name.into(), timeline: Timeline::default(), guides: Vec::new() }
+        Scene { name: name.into(), description: String::new(), duration_frames: 0, timeline: Timeline::default(), guides: Vec::new() }
+    }
+
+    /// Duration of the scene for every output: stage, player, and all export formats.
+    pub fn frame_count(&self) -> u32 {
+        self.timeline.frame_count().max(self.duration_frames).max(1)
     }
 }
 
@@ -1765,6 +1850,9 @@ pub struct Document {
     /// (ADR 0013 tier 1); empty when there is none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub document_class: String,
+    /// Script-owned JSON metadata; saved with the AniCraft document.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub user_metadata: serde_json::Value,
     /// File › Publish Settings: the formats Publish writes and their options (ADR 0060).
     #[serde(default, skip_serializing_if = "publish_is_default")]
     pub publish: Arc<publish::PublishProfile>,
@@ -1810,6 +1898,8 @@ struct DocumentFile {
     #[serde(default)]
     document_class: String,
     #[serde(default)]
+    user_metadata: serde_json::Value,
+    #[serde(default)]
     publish: Arc<publish::PublishProfile>,
     #[serde(default = "default_swatches")]
     swatches: Arc<Vec<Swatch>>,
@@ -1825,9 +1915,9 @@ impl From<DocumentFile> for Document {
     fn from(f: DocumentFile) -> Document {
         let mut scenes = f.scenes;
         if let Some(tl) = f.timeline {
-            scenes.insert(0, Arc::new(Scene { name: "Scene 1".into(), timeline: tl, guides: Vec::new() }));
+            scenes.insert(0, Arc::new(Scene { name: "Scene 1".into(), description: String::new(), duration_frames: 0, timeline: tl, guides: Vec::new() }));
         }
-        Document { stage: f.stage, scenes, library: f.library, bitmaps: f.bitmaps, sounds: f.sounds, library_tree: f.library_tree, document_class: f.document_class, publish: f.publish, aids: f.aids, swatches: f.swatches, eases: f.eases, next_id: f.next_id }
+        Document { stage: f.stage, scenes, library: f.library, bitmaps: f.bitmaps, sounds: f.sounds, library_tree: f.library_tree, document_class: f.document_class, user_metadata: f.user_metadata, publish: f.publish, aids: f.aids, swatches: f.swatches, eases: f.eases, next_id: f.next_id }
     }
 }
 
@@ -1856,13 +1946,13 @@ static NO_TIMELINE: Timeline = Timeline { layers: Vec::new() };
 
 impl PartialEq for Document {
     fn eq(&self, o: &Document) -> bool {
-        self.stage == o.stage && self.next_id == o.next_id && self.document_class == o.document_class && arcs_eq(&self.scenes, &o.scenes) && arcs_eq(&self.library, &o.library) && arcs_eq(&self.bitmaps, &o.bitmaps) && arcs_eq(&self.sounds, &o.sounds) && arc_eq(&self.library_tree, &o.library_tree) && arc_eq(&self.publish, &o.publish) && arc_eq(&self.aids, &o.aids) && arc_eq(&self.swatches, &o.swatches) && arc_eq(&self.eases, &o.eases)
+        self.stage == o.stage && self.next_id == o.next_id && self.document_class == o.document_class && self.user_metadata == o.user_metadata && arcs_eq(&self.scenes, &o.scenes) && arcs_eq(&self.library, &o.library) && arcs_eq(&self.bitmaps, &o.bitmaps) && arcs_eq(&self.sounds, &o.sounds) && arc_eq(&self.library_tree, &o.library_tree) && arc_eq(&self.publish, &o.publish) && arc_eq(&self.aids, &o.aids) && arc_eq(&self.swatches, &o.swatches) && arc_eq(&self.eases, &o.eases)
     }
 }
 
 impl Default for Document {
     fn default() -> Self {
-        let mut d = Document { stage: Stage::default(), scenes: vec![Arc::new(Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Arc::default(), document_class: String::new(), publish: Arc::default(), aids: Arc::default(), swatches: default_swatches(), eases: Arc::default(), next_id: 1 };
+        let mut d = Document { stage: Stage::default(), scenes: vec![Arc::new(Scene::new("Scene 1"))], library: Vec::new(), bitmaps: Vec::new(), sounds: Vec::new(), library_tree: Arc::default(), document_class: String::new(), user_metadata: serde_json::Value::Null, publish: Arc::default(), aids: Arc::default(), swatches: default_swatches(), eases: Arc::default(), next_id: 1 };
         let id = LayerId(d.alloc_id());
         d.timeline_mut(0).layers.push(Arc::new(Layer::new(id, "Layer 1")));
         d
@@ -1901,24 +1991,27 @@ impl Document {
     }
     /// The whole movie's length: every scene, one after the other.
     pub fn frame_count(&self) -> u32 {
-        self.scenes.iter().map(|s| s.timeline.frame_count()).fold(0u32, u32::saturating_add).max(1)
+        self.scenes.iter().map(|s| s.frame_count()).fold(0u32, u32::saturating_add).max(1)
     }
     /// Which scene a movie frame falls in, and the frame within that scene.
     pub fn locate(&self, movie_frame: u32) -> (usize, u32) {
         let mut f = movie_frame;
         for (i, s) in self.scenes.iter().enumerate() {
-            let n = s.timeline.frame_count();
+            let n = s.frame_count();
             if f < n {
                 return (i, f);
             }
             f -= n;
         }
+        // Do not clamp away post-visibility at the end of the last scene. Explicit
+        // requests for later frames must reach the layer evaluator unchanged.
         let last = self.scenes.len().saturating_sub(1);
-        (last, self.timeline(last).frame_count().saturating_sub(1))
+        let last_duration = self.scenes.get(last).map_or(0, |s| s.frame_count());
+        (last, f.saturating_add(last_duration))
     }
     /// The movie frame where scene `i` starts.
     pub fn scene_start(&self, i: usize) -> u32 {
-        self.scenes.iter().take(i).map(|s| s.timeline.frame_count()).fold(0u32, u32::saturating_add)
+        self.scenes.iter().take(i).map(|s| s.frame_count()).fold(0u32, u32::saturating_add)
     }
     /// Every timeline: the scenes', then the library symbols', then the groups' inside them (ADR
     /// 0073), so whatever walks every timeline (Library uses, sounds, paths) sees inside groups.

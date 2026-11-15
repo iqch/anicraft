@@ -434,10 +434,10 @@ fn row_header(app: &mut App, ui: &mut egui::Ui, side: Side, g: &Group, group: Re
             let mut anchor = None;
             for (i, tab) in g.tabs.iter().enumerate() {
                 let active = i == g.active.min(g.tabs.len() - 1);
-                let r = ui.selectable_label(active, text(Type::Heading, crate::i18n::t(tab.label())));
-                // A drag on the tab moves the panel; its clicks stay the label's.
-                let drag = ui.interact(r.rect, Id::new(("dock_tab_drag", tab.id())), Sense::drag() - Sense::FOCUSABLE);
-                if drag.drag_started() {
+                // One widget owns both click and drag: a drag-only overlay used to
+                // intercept clicks on earlier tabs in the same group.
+                let r = ui.add(egui::Button::selectable(active, text(Type::Heading, crate::i18n::t(tab.label()))).sense(Sense::click_and_drag()));
+                if r.drag_started() {
                     app.dock_view.drag = Some(*tab);
                 }
                 let r = r.on_hover_text(tab_tip(*tab));
@@ -597,6 +597,12 @@ pub fn panel_body(app: &mut App, ui: &mut egui::Ui, p: Panel) {
         }
         Panel::LayerDepth => {
             scroll("layer_depth").show(ui, |ui| pad(12, 8).show(ui, |ui| crate::layer_depth::panel(app, ui)));
+        }
+        Panel::PythonConsole => {
+            #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+            crate::python::console(app, ui);
+            #[cfg(not(all(feature = "python", not(target_arch = "wasm32"))))]
+            ui.label("Python support is not enabled in this build");
         }
         Panel::Timeline => crate::timeline::show(app, ui),
         Panel::MotionEditor => crate::motion_editor::show(app, ui),

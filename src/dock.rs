@@ -29,11 +29,12 @@ pub enum Panel {
     Actions,
     Output,
     Swatches,
+    PythonConsole,
 }
 
 impl Panel {
     /// In the Window menu's order.
-    pub const ALL: [Panel; 12] = [Panel::Actions, Panel::Align, Panel::Colour, Panel::History, Panel::LayerDepth, Panel::Library, Panel::MotionEditor, Panel::MovieExplorer, Panel::Output, Panel::Properties, Panel::Swatches, Panel::Timeline];
+    pub const ALL: [Panel; 13] = [Panel::Actions, Panel::Align, Panel::Colour, Panel::History, Panel::LayerDepth, Panel::Library, Panel::MotionEditor, Panel::MovieExplorer, Panel::Output, Panel::Properties, Panel::PythonConsole, Panel::Swatches, Panel::Timeline];
 
     /// Its machine name, in the preferences (English, never translated).
     pub fn id(self) -> &'static str {
@@ -50,6 +51,7 @@ impl Panel {
             Panel::Actions => "actions",
             Panel::Output => "output",
             Panel::Swatches => "swatches",
+            Panel::PythonConsole => "python_console",
         }
     }
 
@@ -72,13 +74,14 @@ impl Panel {
             Panel::Actions => tr_noop!("Actions"),
             Panel::Output => tr_noop!("Output"),
             Panel::Swatches => tr_noop!("Swatches"),
+            Panel::PythonConsole => "Python Console",
         }
     }
 
     /// The size a floating window of it starts at, in points.
     pub fn float_size(self) -> [f32; 2] {
         match self {
-            Panel::Timeline | Panel::MotionEditor => [900.0, 320.0],
+            Panel::Timeline | Panel::MotionEditor | Panel::PythonConsole => [900.0, 320.0],
             Panel::Actions => [460.0, 520.0],
             Panel::Output => [520.0, 300.0],
             Panel::Align => [300.0, 140.0],
@@ -459,7 +462,7 @@ fn default_home(p: Panel) -> Home {
         Panel::Swatches => (Side::Right, Some(Panel::Colour)),
         Panel::Library | Panel::MovieExplorer => (Side::Right, Some(Panel::Library)),
         Panel::History => (Side::Right, None),
-        Panel::Timeline | Panel::MotionEditor | Panel::Output => (Side::Bottom, Some(Panel::Timeline)),
+        Panel::Timeline | Panel::MotionEditor | Panel::Output | Panel::PythonConsole => (Side::Bottom, Some(Panel::Timeline)),
         Panel::Actions => (Side::Right, None),
         // Layer Depth opens as a tab beside the Library, under Properties, where it has the
         // width for its tracks.
@@ -485,20 +488,20 @@ pub fn built_in(key: &str) -> Option<Layout> {
         // right; the timeline and the Motion Editor below the stage.
         "essentials" => Layout {
             right: zone(vec![Group::of(&[Panel::Properties], 6.4), Group::of(&[Panel::Align], 1.3), Group::of(&[Panel::Library, Panel::MovieExplorer], 3.2), Group::of(&[Panel::History], 1.4)], None),
-            bottom: zone(vec![Group::of(&[Panel::Timeline, Panel::MotionEditor], 1.0)], None),
+            bottom: zone(vec![Group::of(&[Panel::Timeline, Panel::MotionEditor, Panel::PythonConsole], 1.0)], None),
             ..Layout::default()
         },
         // Animation first: a tall timeline with the Output and History beside it, a slim right
         // dock.
         "animator" => Layout {
             right: zone(vec![Group::of(&[Panel::Properties, Panel::Align], 5.0), Group::of(&[Panel::Library, Panel::MovieExplorer], 4.0)], Some(280.0)),
-            bottom: zone(vec![Group::of(&[Panel::Timeline, Panel::MotionEditor], 3.0), Group::of(&[Panel::Output, Panel::History], 1.0)], Some(440.0)),
+            bottom: zone(vec![Group::of(&[Panel::Timeline, Panel::MotionEditor, Panel::PythonConsole], 3.0), Group::of(&[Panel::Output, Panel::History], 1.0)], Some(440.0)),
             ..Layout::default()
         },
         // Drawing first: a wide Properties with Colour, Swatches and Align, a short timeline.
         "designer" => Layout {
             right: zone(vec![Group::of(&[Panel::Properties], 6.0), Group::of(&[Panel::Colour, Panel::Swatches, Panel::Align], 2.6), Group::of(&[Panel::Library, Panel::MovieExplorer, Panel::History], 3.6)], Some(400.0)),
-            bottom: zone(vec![Group::of(&[Panel::Timeline, Panel::MotionEditor], 1.0)], Some(200.0)),
+            bottom: zone(vec![Group::of(&[Panel::Timeline, Panel::MotionEditor, Panel::PythonConsole], 1.0)], Some(200.0)),
             ..Layout::default()
         },
         _ => return None,
@@ -544,6 +547,17 @@ impl Workspaces {
     /// The layout in use (Essentials when the current one is gone).
     pub fn layout(&self) -> Layout {
         let mut l = self.live.get(&self.current).cloned().or_else(|| self.base(&self.current)).or_else(|| built_in("essentials")).unwrap_or_default();
+        // Upgrade saved layouts from builds without the Python Console tab, without
+        // changing their currently active tab or undoing an intentional close.
+        if !l.homes.contains_key(&Panel::PythonConsole) && !l.is_open(Panel::PythonConsole) {
+            if let Some(Place::Docked { side, group, .. }) = l.place(Panel::Timeline) {
+                let active = l.zone(side).groups[group].active;
+                l.move_to(Panel::PythonConsole, Target::Stack(Panel::Timeline));
+                if let Some(g) = l.zone_mut(side).groups.get_mut(group) { g.active = active; }
+            } else {
+                l.homes.insert(Panel::PythonConsole, default_home(Panel::PythonConsole));
+            }
+        }
         l.tidy();
         l
     }
@@ -659,7 +673,7 @@ mod tests {
         let l = essentials();
         let tabs = |z: &Zone| z.groups.iter().map(|g| g.tabs.clone()).collect::<Vec<_>>();
         assert_eq!(tabs(&l.right), vec![vec![Panel::Properties], vec![Panel::Align], vec![Panel::Library, Panel::MovieExplorer], vec![Panel::History]]);
-        assert_eq!(tabs(&l.bottom), vec![vec![Panel::Timeline, Panel::MotionEditor]]);
+        assert_eq!(tabs(&l.bottom), vec![vec![Panel::Timeline, Panel::MotionEditor, Panel::PythonConsole]]);
         assert!(l.left.groups.is_empty() && l.top.groups.is_empty() && l.floating.is_empty());
         assert_eq!((l.right.size, l.bottom.size), (None, None), "sized from the window, as before");
         for p in [Panel::Properties, Panel::Align, Panel::Library, Panel::History, Panel::Timeline] {
@@ -713,7 +727,7 @@ mod tests {
         // The timeline above the stage (#249).
         l.move_to(Panel::Timeline, Target::Split { side: Side::Top, before: None });
         assert_eq!(l.top.groups.len(), 1);
-        assert_eq!(l.bottom.groups[0].tabs, vec![Panel::MotionEditor]);
+        assert_eq!(l.bottom.groups[0].tabs, vec![Panel::MotionEditor, Panel::PythonConsole]);
         // Stacked with the Library as a tab, and shown.
         l.move_to(Panel::History, Target::Stack(Panel::Library));
         assert_eq!(l.right.groups.len(), 3);

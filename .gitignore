@@ -22,3 +22,14 @@ Thumbs.db
 
 # parallel milestone worktrees (AGENTS.md › Milestone tracks)
 /.worktrees/
+/scripts/userSetup.py
+pgVision
+/run-local.cmd
+/run-remote.cmd
+/run.cmd
+build
+.delta
+.versions
+/anicraft.zip
+.turns
+/scripts/__userSetup.py

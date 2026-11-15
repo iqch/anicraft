@@ -1056,14 +1056,18 @@ fn import_from<'a>(read: &'a Reader<'a>, fonts: Option<&'a Fonts>) -> Result<(Do
     for (i, tl) in scenes.iter().enumerate() {
         let name: String = tl.attr("name").filter(|n| !n.trim().is_empty()).map_or_else(|| format!("Scene {}", i + 1), |n| n.chars().take(256).collect());
         let timeline = b.timeline(tl);
-        b.doc.scenes.push(Arc::new(Scene { name, timeline, guides: Vec::new() }));
+        let mut scene = Scene::new(name);
+        scene.timeline = timeline;
+        b.doc.scenes.push(Arc::new(scene));
     }
     if !b.doc.library_tree.folders.is_empty() {
         b.report.keep("library folders");
     }
     if b.doc.scenes.is_empty() {
         let timeline = Timeline { layers: vec![Arc::new(Layer::new(LayerId(b.doc.alloc_id()), "Layer 1"))] };
-        b.doc.scenes.push(Arc::new(Scene { name: "Scene 1".into(), timeline, guides: Vec::new() }));
+        let mut scene = Scene::new("Scene 1");
+        scene.timeline = timeline;
+        b.doc.scenes.push(Arc::new(scene));
     }
     Ok((b.doc, b.report))
 }

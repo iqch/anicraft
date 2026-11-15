@@ -657,7 +657,12 @@ impl<'a> Bake<'a> {
                 }
                 match sym.kind {
                     SymbolKind::Graphic => {
-                        let g = loop_mode.local_frame(f.saturating_sub(start), *first_frame, len);
+                        let rel = if f < start && *loop_mode == anicraft_doc::LoopMode::Loop {
+                            (i64::from(f) - i64::from(start)).rem_euclid(i64::from(len.max(1))) as u32
+                        } else {
+                            f.saturating_sub(start)
+                        };
+                        let g = loop_mode.local_frame(rel, *first_frame, len);
                         if g > 0 {
                             o.insert("g".into(), json!(g));
                         }
@@ -712,8 +717,8 @@ impl<'a> Bake<'a> {
     /// camera's tint (`cc`) and each layer its view (`v`: the camera and the layer's depth).
     /// `decls`: the declarations its frame scripts share (ADR 0052), for timelines that
     /// run scripts; their functions go out as `fn` and their variables' types as `vt`.
-    fn timeline(&mut self, tl: &Timeline, scene: bool, decls: Option<&Decls>) -> Value {
-        let n = tl.frame_count();
+    fn timeline(&mut self, tl: &Timeline, scene: bool, decls: Option<&Decls>, duration: Option<u32>) -> Value {
+        let n = duration.unwrap_or_else(|| tl.frame_count());
         // One clip slot per visible mask layer, top first (as the evaluator numbers them).
         let slots: HashMap<u64, usize> = tl.layers.iter().filter(|l| l.kind == LayerKind::Mask && l.visible).enumerate().map(|(i, l)| (l.id.0, i)).collect();
         let playing: Vec<usize> = (0..tl.layers.len()).filter(|&i| plays(tl, i)).collect();
@@ -759,8 +764,9 @@ impl<'a> Bake<'a> {
                 let walk = layer.parent.and_then(|p| tl.layer(p)).filter(|g| g.kind == LayerKind::Guide).and_then(|g| guide_walk(g, f));
                 let mut items = Vec::new();
                 if let Some((start, els)) = evaluate_shown(layer, f, walk.as_ref(), self.doc.stage.fps) {
+                    let clock = layer.display_clock(f).unwrap_or(f);
                     for el in els.iter() {
-                        self.element(el, layer, f, start, &mut items);
+                        self.element(el, layer, clock, start, &mut items);
                     }
                 }
                 if items.is_empty() && layer.kind != LayerKind::Mask {
@@ -932,15 +938,15 @@ pub fn movie(doc: &Document, opts: &HtmlOptions) -> Movie {
     // The main timeline's scripts share one set of declarations over every scene.
     let root = anicraft_doc::player::decls(doc, TimelineRef::Root);
     for s in &doc.scenes {
-        frames += s.timeline.frame_count() as usize;
-        timelines.push(b.timeline(&s.timeline, true, Some(&root)));
+        frames += s.frame_count() as usize;
+        timelines.push(b.timeline(&s.timeline, true, Some(&root), Some(s.frame_count())));
     }
     let mut symbols = Vec::with_capacity(used.len());
     for (i, id) in used.iter().enumerate() {
         let Some(sym) = doc.symbol(*id) else { continue };
         frames += sym.timeline.frame_count() as usize;
         let decls = (sym.kind == SymbolKind::MovieClip).then(|| anicraft_doc::player::decls(doc, TimelineRef::Symbol(*id)));
-        timelines.push(b.timeline(&sym.timeline, false, decls.as_ref()));
+        timelines.push(b.timeline(&sym.timeline, false, decls.as_ref(), None));
         let kind = match sym.kind {
             SymbolKind::Graphic => "graphic",
             SymbolKind::MovieClip => "movieclip",

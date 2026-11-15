@@ -37,6 +37,7 @@ mod cmds_recovery;
 mod cmds_script;
 pub mod cmds_plugin;
 mod cmds_scene;
+mod descriptions;
 pub mod cmds_sound;
 pub mod cmds_text;
 mod cmds_timeline;
@@ -146,6 +147,7 @@ pub fn commands() -> Vec<CommandSpec> {
     v.extend(cmds_ease::specs());
     v.extend(cmds_hints::specs());
     v.extend(cmds_scene::specs());
+    v.extend(descriptions::specs());
     v.extend(cmds_frames::specs());
     v.extend(onion::specs());
     v.extend(multi::specs());
@@ -332,6 +334,9 @@ pub struct Session {
     pub clipboard: cmds_modify::Clipboard,
     /// Copied frames (Copy Frames), separate from copied artwork as in Animate.
     pub frame_clipboard: cmds_frames::FrameClipboard,
+    /// Copied complete layer / folder tree for Duplicate Layer, Copy Layer, Paste Layer.
+    /// This is session-only and does not enter the document or undo history.
+    pub layer_clipboard: Option<cmds_timeline::LayerClipboard>,
     /// A copied ease (Copy Ease, ADR 0081), for Paste Ease.
     pub ease_clipboard: Option<anicraft_doc::Easing>,
     /// A command is editing a motion tween's target (auto-key, ADR 0016).
@@ -427,6 +432,7 @@ impl Session {
             dl_cache: RefCell::new(None),
             clipboard: cmds_modify::Clipboard::default(),
             frame_clipboard: cmds_frames::FrameClipboard::default(),
+            layer_clipboard: None,
             ease_clipboard: None,
             motion_edit: None,
             plugins: anicraft_plugins::Registry::default(),
@@ -459,6 +465,21 @@ impl Session {
     /// and the title treat it as unsaved work.
     pub fn mark_unsaved(&mut self) {
         self.saved_state = None;
+    }
+
+    /// Script-owned metadata is a document edit, not transient Python state.
+    /// In particular it participates in Undo and the unsaved-work guard.
+    pub fn set_user_metadata(&mut self, value: Value) {
+        if self.doc.user_metadata == value {
+            return;
+        }
+        self.end_gesture();
+        self.heal_cut();
+        let before = self.snapshot("Update script metadata");
+        self.doc.user_metadata = value;
+        self.state = history::fresh_state();
+        self.revision += 1;
+        self.history.record(before, &self.doc);
     }
 
     /// The confirmation running `id` with `params` needs right now (ADR 0004).
@@ -809,7 +830,11 @@ impl Session {
     // ----- queries ---------------------------------------------------------------------------
 
     pub fn frame_count(&self) -> u32 {
-        self.timeline().frame_count()
+        if self.editing.is_empty() {
+            self.doc.scenes.get(self.scene).map_or(1, |scene| scene.frame_count())
+        } else {
+            self.timeline().frame_count()
+        }
     }
 
     pub fn active_layer(&self) -> Option<&Layer> {
@@ -1009,7 +1034,7 @@ impl Session {
             "frames": self.frame_count(),
             "frame": self.frame,
             "scene": self.scene,
-            "scenes": self.doc.scenes.iter().map(|s| json!({"name": s.name, "frames": s.timeline.frame_count()})).collect::<Vec<_>>(),
+            "scenes": self.doc.scenes.iter().map(|s| json!({"name": s.name, "frames": s.frame_count()})).collect::<Vec<_>>(),
             "movie_frames": self.doc.frame_count(),
             "layer": self.layer.0,
             "selection": self.selection.id_list(),
@@ -1090,6 +1115,9 @@ pub fn element_label(doc: &Document, e: &Element) -> String {
     };
     if e.name.is_empty() { kind } else { format!("{} ({kind})", e.name) }
 }
+
+#[cfg(test)]
+mod layer_copy_tests;
 
 #[cfg(test)]
 mod tests;

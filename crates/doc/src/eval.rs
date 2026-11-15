@@ -244,7 +244,7 @@ pub fn evaluate_layer_elements(layer: &Layer, frame: u32) -> Option<(u32, Cow<'_
 pub fn evaluate_guided<'a>(layer: &'a Layer, frame: u32, guide: Option<&PathWalk>) -> Option<(u32, Cow<'a, [Arc<Element>]>)> {
     let (start, els) = evaluate_tweened(layer, frame, guide)?;
     let Some(arm) = layer.armature.as_deref().filter(|a| layer.kind == crate::LayerKind::Armature && !a.is_empty()) else { return Some((start, els)) };
-    let pose = crate::armature::pose_at(layer, frame).unwrap_or_default();
+    let pose = crate::armature::pose_at(layer, layer.displayed_frame(frame)?).unwrap_or_default();
     let mut els = els.into_owned();
     crate::armature::apply(arm, &mut els, &pose);
     Some((start, Cow::Owned(els)))
@@ -257,13 +257,14 @@ pub fn evaluate_guided<'a>(layer: &'a Layer, frame: u32, guide: Option<&PathWalk
 pub fn evaluate_shown<'a>(layer: &'a Layer, frame: u32, guide: Option<&PathWalk>, fps: f32) -> Option<(u32, Cow<'a, [Arc<Element>]>)> {
     let Some(arm) = layer.armature.as_deref().filter(|a| layer.kind == crate::LayerKind::Armature && a.has_springs()) else { return evaluate_guided(layer, frame, guide) };
     let (start, els) = evaluate_tweened(layer, frame, guide)?;
-    let pose = crate::spring::sprung_pose(layer, frame, fps).unwrap_or_default();
+    let pose = crate::spring::sprung_pose(layer, layer.displayed_frame(frame)?, fps).unwrap_or_default();
     let mut els = els.into_owned();
     crate::armature::apply(arm, &mut els, &pose);
     Some((start, Cow::Owned(els)))
 }
 
 pub(crate) fn evaluate_tweened<'a>(layer: &'a Layer, frame: u32, guide: Option<&PathWalk>) -> Option<(u32, Cow<'a, [Arc<Element>]>)> {
+    let frame = layer.displayed_frame(frame)?;
     let idx = layer.keyframe_index_at(frame)?;
     let kf = layer.keyframes.get(idx)?;
     // A motion tween: its target follows the property curves (and its motion path, ADR 0030);
@@ -456,7 +457,10 @@ impl Ctx {
 /// The first frame of the unbroken run of keyframes on `layer`, up to `frame`, that hold
 /// element `id` as an instance of `symbol`: where a movie clip instance started playing.
 pub fn instance_start(layer: &Layer, frame: u32, id: ElementId, symbol: SymbolId) -> u32 {
-    let Some(mut i) = layer.keyframe_index_at(frame) else { return frame };
+    // An outside-span frame can display a held keyframe. Use that authored frame
+    // to find the instance's original start, but retain the real clock outside.
+    let sampled = layer.displayed_frame(frame).unwrap_or(frame);
+    let Some(mut i) = layer.keyframe_index_at(sampled) else { return frame };
     let holds = |k: &crate::Keyframe| k.elements.iter().any(|e| e.id == id && matches!(e.kind, ElementKind::Symbol { symbol: s, .. } if s == symbol));
     let mut start = layer.keyframes.get(i).map_or(frame, |k| k.start);
     while let Some(prev) = i.checked_sub(1).and_then(|p| layer.keyframes.get(p)) {
@@ -546,7 +550,8 @@ fn eval_timeline(doc: &Document, tl: &Timeline, frame: u32, cx: &Ctx, out: &mut 
         let guide = cx.guide || is_guide;
         // A layer guided by a guide layer: its tweens follow the guide's first path.
         let walk = layer.parent.and_then(|p| tl.layer(p)).filter(|g| g.kind == LayerKind::Guide).and_then(|g| guide_walk(g, frame));
-        let Some((kf_start, elements)) = evaluate_shown(layer, frame, walk.as_ref(), doc.stage.fps) else { continue };
+        let Some(drawn_frame) = layer.displayed_frame(frame) else { continue };
+        let Some((kf_start, elements)) = evaluate_shown(layer, drawn_frame, walk.as_ref(), doc.stage.fps) else { continue };
         let layer_outline = cx.outline.or(if layer.outline && cx.stage { Some(layer.color) } else { None });
         // Through a camera, each layer is placed by the camera and its own depth (an attached
         // layer stays put); a layer the camera has passed isn't drawn.
@@ -557,11 +562,27 @@ fn eval_timeline(doc: &Document, tl: &Timeline, frame: u32, cx: &Ctx, out: &mut 
             },
             None => cx.xf,
         };
-        let lc = LayerCtx { layer, frame, kf_start, clip, masks, guide, outline: layer_outline, xf: layer_xf };
+        // Sample artwork at the boundary. Hold also freezes nested symbol time there;
+        // Continue keeps the scene clock, including a backwards-running pre-span loop.
+        let clock = layer.display_clock(frame).unwrap_or(frame);
+        let lc = LayerCtx { layer, frame: clock, kf_start, clip, masks, guide, outline: layer_outline, xf: layer_xf };
         for el in elements.iter() {
             eval_element(doc, cx, &lc, el, out, play);
         }
     }
+}
+
+/// A Graphic Symbol follows the actual parent frame even when the host layer holds
+/// its first/last keyed artwork outside the authored span. Looping symbols also run
+/// backwards through their timeline during pre-visibility; PlayOnce and SingleFrame
+/// retain their regular boundary behaviour.
+pub(crate) fn graphic_frame(mode: crate::LoopMode, frame: u32, start: u32, first: u32, len: u32) -> u32 {
+    if frame >= start || mode != crate::LoopMode::Loop {
+        return mode.local_frame(frame.saturating_sub(start), first, len);
+    }
+    let len = i64::from(len.max(1));
+    let offset = (i64::from(frame) - i64::from(start)).rem_euclid(len);
+    mode.local_frame(offset as u32, first, len as u32)
 }
 
 /// The layer an element is drawn on, as [`eval_element`] needs it.
@@ -698,7 +719,7 @@ fn eval_element(doc: &Document, cx: &Ctx, lc: &LayerCtx<'_>, el: &Element, out: 
             let len = sym.timeline.frame_count();
             let local = match (sym.kind, &child) {
                 // A graphic keeps step with this timeline: loop mode and first frame apply.
-                (SymbolKind::Graphic, _) => loop_mode.local_frame(frame.saturating_sub(kf_start), *first_frame, len),
+                (SymbolKind::Graphic, _) => graphic_frame(*loop_mode, frame, kf_start, *first_frame, len),
                 // In the player, movie clips and buttons are where it has them.
                 (SymbolKind::MovieClip, Some(c)) => c.state.clip_frame(&c.path, len),
                 (SymbolKind::Button, Some(c)) => c.state.button_frame(&c.path, len),

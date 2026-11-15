@@ -13,6 +13,7 @@ pub fn specs() -> Vec<CommandSpec> {
         c("scene.new", "Scene", "Insert", None, "{name?}", true, new_scene as crate::RunFn),
         c("scene.duplicate", "Duplicate Scene", "Modify/Scene", None, "{scene?}", true, duplicate_scene),
         c("scene.rename", "Rename Scene", "Modify/Scene", None, "{name, scene?}", true, rename_scene),
+        c("scene.set_duration", "Set Scene Duration", "Modify/Scene", None, "{frames: positive integer (1..100000) | 0 (automatic), scene?}: minimum movie length independent of layers' last authored frame", true, set_duration),
         c("scene.delete", "Delete Scene", "Modify/Scene", None, "{scene?}", true, delete_scene),
         c("scene.move_up", "Move Scene Earlier", "Modify/Scene", None, "{scene?}", true, |s, p| move_scene(s, p, -1)),
         c("scene.move_down", "Move Scene Later", "Modify/Scene", None, "{scene?}", true, |s, p| move_scene(s, p, 1)),
@@ -78,47 +79,77 @@ fn new_scene(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// A copy of `tl` with fresh layer and element ids (ids are unique across the whole document),
 /// and mask links pointing at the copied masks.
-fn reid(s: &mut Session, tl: &Timeline) -> Timeline {
-    let map: Vec<(LayerId, LayerId)> = tl.layers.iter().map(|l| (l.id, LayerId(s.doc.alloc_id()))).collect();
-    let new_id = |old: LayerId| map.iter().find(|(o, _)| *o == old).map(|(_, n)| *n);
-    let mut layers = Vec::with_capacity(tl.layers.len());
-    for l in &tl.layers {
-        let mut copy: Layer = (**l).clone();
-        copy.id = new_id(l.id).unwrap_or(copy.id);
-        copy.parent = l.parent.and_then(new_id);
-        // Elements keep their id across a layer's keyframes (tweens pair them), so map per layer.
-        let mut emap: Vec<(ElementId, ElementId)> = Vec::new();
-        copy.keyframes = l
-            .keyframes
-            .iter()
-            .map(|k| {
-                let mut nk: Keyframe = (**k).clone();
-                nk.elements = k
-                    .elements
-                    .iter()
-                    .map(|e| {
-                        let id = match emap.iter().find(|(o, _)| *o == e.id) {
-                            Some((_, n)) => *n,
-                            None => {
-                                let n = ElementId(s.doc.alloc_id());
-                                emap.push((e.id, n));
-                                n
-                            }
-                        };
-                        Arc::new(Element { id, ..(**e).clone() })
-                    })
-                    .collect();
-                if let Some(m) = nk.motion.as_mut()
-                    && let Some((_, n)) = emap.iter().find(|(o, _)| *o == m.target)
-                {
-                    m.target = *n;
-                }
-                Arc::new(nk)
-            })
-            .collect();
-        layers.push(Arc::new(copy));
+pub(crate) fn reid(s: &mut Session, tl: &Timeline) -> Timeline {
+    use anicraft_doc::{BoneId, ElementKind};
+    use std::collections::BTreeMap;
+    let mut layer_ids = BTreeMap::new();
+    for layer in &tl.layers {
+        layer_ids.insert(layer.id, LayerId(s.doc.alloc_id()));
     }
-    Timeline { layers }
+    let mut result = Vec::with_capacity(tl.layers.len());
+    for layer in &tl.layers {
+        let mut cloned = (**layer).clone();
+        cloned.id = layer_ids.get(&layer.id).copied().unwrap_or(layer.id);
+        cloned.parent = layer.parent.and_then(|p| layer_ids.get(&p).copied());
+        // One ID across a sequence of tweened keyframes must stay one ID in the copy.
+        let mut element_ids = BTreeMap::new();
+        for key in &layer.keyframes {
+            for element in &key.elements {
+                element_ids.entry(element.id).or_insert_with(|| ElementId(s.doc.alloc_id()));
+            }
+        }
+        let mut bone_ids = BTreeMap::<BoneId, BoneId>::new();
+        if let Some(armature) = &layer.armature {
+            // Shape-rig joints have element-sized IDs that do not necessarily
+            // correspond to visible keyframe elements. They still need fresh IDs.
+            for bone in &armature.bones {
+                element_ids.entry(bone.parent).or_insert_with(|| ElementId(s.doc.alloc_id()));
+                element_ids.entry(bone.child).or_insert_with(|| ElementId(s.doc.alloc_id()));
+            }
+            let mut armature = (**armature).clone();
+            for bone in &armature.bones {
+                bone_ids.insert(bone.id, BoneId(s.doc.alloc_id()));
+            }
+            for bone in &mut armature.bones {
+                bone.id = bone_ids.get(&bone.id).copied().unwrap_or(bone.id);
+                bone.parent = element_ids.get(&bone.parent).copied().unwrap_or(bone.parent);
+                bone.child = element_ids.get(&bone.child).copied().unwrap_or(bone.child);
+            }
+            if let Some(skin) = &mut armature.skin {
+                skin.shape = element_ids.get(&skin.shape).copied().unwrap_or(skin.shape);
+                for point in &mut skin.points {
+                    for influence in &mut point.bones {
+                        influence.0 = bone_ids.get(&influence.0).copied().unwrap_or(influence.0);
+                    }
+                }
+            }
+            cloned.armature = Some(Arc::new(armature));
+        }
+        let mut new_keys = Vec::with_capacity(layer.keyframes.len());
+        for key in &layer.keyframes {
+            let mut copied = (**key).clone();
+            let mut new_elements = Vec::with_capacity(key.elements.len());
+            for element in &key.elements {
+                let mut e = (**element).clone();
+                e.id = element_ids.get(&e.id).copied().unwrap_or(e.id);
+                if let ElementKind::Group { members } = &mut e.kind {
+                    *members = reid(s, members);
+                }
+                new_elements.push(Arc::new(e));
+            }
+            copied.elements = new_elements;
+            if let Some(motion) = &mut copied.motion {
+                motion.target = element_ids.get(&motion.target).copied().unwrap_or(motion.target);
+            }
+            for joint in &mut copied.pose.0 {
+                joint.bone = bone_ids.get(&joint.bone).copied().unwrap_or(joint.bone);
+            }
+            new_keys.push(Arc::new(copied));
+        }
+        cloned.keyframes = new_keys;
+        result.push(Arc::new(cloned));
+    }
+    Timeline { layers: result }
 }
 
 fn duplicate_scene(s: &mut Session, p: &Value) -> Result<Value> {
@@ -127,7 +158,7 @@ fn duplicate_scene(s: &mut Session, p: &Value) -> Result<Value> {
     let Some(src) = s.doc.scenes.get(i).cloned() else { return Err(EngineError::State("no such scene".into())) };
     let timeline = reid(s, &src.timeline);
     let name = unused_name(s, &format!("{} copy", src.name));
-    s.doc.scenes.insert(i + 1, Arc::new(Scene { name, timeline, guides: src.guides.clone() }));
+    s.doc.scenes.insert(i + 1, Arc::new(Scene { name, description: src.description.clone(), duration_frames: src.duration_frames, timeline, guides: src.guides.clone() }));
     open_scene(s, i + 1);
     Ok(scene_json(s))
 }
@@ -142,6 +173,21 @@ fn rename_scene(s: &mut Session, p: &Value) -> Result<Value> {
         Arc::make_mut(sc).name = name.clone();
     }
     Ok(json!({"scene": i, "name": name}))
+}
+
+/// Set an independent scene length. When absent (zero), derive it from authored keyframes.
+/// Frames beyond the last keyed frame can now show Off/Hold/Continue consistently in the
+/// editor, movie player, exported sequences, GIFs and movies.
+fn set_duration(s: &mut Session, p: &Value) -> Result<Value> {
+    let frames = opt_u32(p, "frames")?.ok_or_else(|| EngineError::Param("param 'frames' is required".into()))?;
+    if frames > crate::MAX_FRAME {
+        return Err(EngineError::Param("param 'frames' must be 0..100000".into()));
+    }
+    let i = target_scene(s, p)?;
+    if let Some(scene) = s.doc.scenes.get_mut(i) {
+        Arc::make_mut(scene).duration_frames = frames;
+    }
+    Ok(json!({"scene": i, "duration_frames": frames, "frames": s.doc.scenes[i].frame_count()}))
 }
 
 fn delete_scene(s: &mut Session, p: &Value) -> Result<Value> {

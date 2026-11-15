@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ColorEffect, Easing, Keyframe, Symbol, SymbolId, SymbolKind, Tween, TweenKind};
+use crate::{ColorEffect, Easing, Keyframe, OutsideFrameMode, Symbol, SymbolId, SymbolKind, Tween, TweenKind};
 
 fn shape_el(id: u64, x: f32) -> Element {
     Element {
@@ -579,4 +579,156 @@ fn instance_filters_tween_when_they_pair_up() {
     // Lists that don't pair up hold the first keyframe's.
     assert_eq!(crate::filter::lerp_filters(&[blur(1.0)], &[Filter::new("glow").unwrap()], 0.5), None);
     assert_eq!(crate::filter::lerp_filters(&[blur(1.0)], &[blur(1.0), blur(2.0)], 0.5), None);
+}
+
+#[test]
+fn a_layer_without_keyframes_never_draws_even_with_pre_and_post_visibility() {
+    let mut d = Document::default();
+    {
+        let l = layer0(&mut d);
+        l.keyframes.clear();
+        l.pre_visibility = OutsideFrameMode::Hold;
+        l.post_visibility = OutsideFrameMode::Continue;
+    }
+    for frame in [0, 1, 15, 100] {
+        assert!(evaluate_layer_elements(&d.timeline(0).layers[0], frame).is_none(), "no keys at {frame}");
+        assert!(evaluate_scene(&d, 0, frame).items.is_empty(), "no rendered items at {frame}");
+    }
+}
+
+#[test]
+fn visibility_outside_keyed_range_is_independent_and_does_not_fill_gaps() {
+    let mut d = Document::default();
+    let mut first = Keyframe::new(5, 3);
+    first.elements.push(Arc::new(shape_el(21, 12.0)));
+    let mut last = Keyframe::new(15, 2);
+    last.elements.push(Arc::new(shape_el(22, 40.0)));
+    let l = layer0(&mut d);
+    l.keyframes = vec![Arc::new(first), Arc::new(last)];
+    assert!(evaluate_layer_elements(l, 4).is_none());
+    assert!(evaluate_layer_elements(l, 8).is_none());
+    assert!(evaluate_layer_elements(l, 17).is_none());
+    assert_eq!(l.displayed_frame(5), Some(5));
+    assert_eq!(l.displayed_frame(16), Some(16));
+    l.pre_visibility = OutsideFrameMode::Hold;
+    assert_eq!(l.displayed_frame(0), Some(5));
+    assert_eq!(l.display_clock(0), Some(5));
+    assert_eq!(evaluate_layer_elements(l, 0).unwrap().1[0].id, ElementId(21));
+    assert!(evaluate_layer_elements(l, 17).is_none());
+    l.pre_visibility = OutsideFrameMode::Continue;
+    assert_eq!(l.display_clock(0), Some(0));
+    l.post_visibility = OutsideFrameMode::Hold;
+    assert_eq!(l.displayed_frame(99), Some(16));
+    assert_eq!(l.display_clock(99), Some(16));
+    assert_eq!(evaluate_layer_elements(l, 99).unwrap().1[0].id, ElementId(22));
+    l.post_visibility = OutsideFrameMode::Continue;
+    assert_eq!(l.display_clock(99), Some(99));
+    assert!(evaluate_layer_elements(l, 9).is_none(), "internal keyframe gaps remain empty");
+    assert_eq!(evaluate_scene(&d, 0, 0).items.len(), 1);
+    assert!(evaluate_scene(&d, 0, 9).items.is_empty());
+    assert_eq!(evaluate_scene(&d, 0, 99).items.len(), 1);
+}
+
+#[test]
+fn outside_visibility_hold_freezes_graphic_time_continue_runs() {
+    let mut d = Document::default();
+    let sid = SymbolId(200);
+    let mut tl = Timeline::default();
+    let mut inner = Layer::new(LayerId(201), "Animated Graphic");
+    inner.keyframes = (0..3).map(|i| {
+        let mut k = Keyframe::new(i, 1);
+        k.elements.push(Arc::new(shape_el(202 + u64::from(i), (i * 10) as f32)));
+        Arc::new(k)
+    }).collect();
+    tl.layers.push(Arc::new(inner));
+    d.library.push(Arc::new(Symbol { id: sid, name: "Animated Graphic".into(), kind: SymbolKind::Graphic, linkage: None, scale_grid_kept: None, scale_grid: None, timeline: tl }));
+    let mut outer = Keyframe::new(5, 1);
+    outer.elements.push(Arc::new(Element {
+        id: ElementId(205), name: "Instance".into(), transform: Affine::IDENTITY,
+        color: ColorEffect::default(),
+        kind: ElementKind::Symbol { symbol: sid, loop_mode: crate::LoopMode::Loop, first_frame: 0, blend: Default::default(), filters: Vec::new(), events: Vec::new() },
+    }));
+    layer0(&mut d).keyframes = vec![Arc::new(outer)];
+    let x = |d: &Document, f| evaluate_scene(d, 0, f).items.first().map(|e| e.transform.translation().x);
+    assert_eq!(x(&d, 4), None);
+    assert_eq!(x(&d, 6), None);
+    layer0(&mut d).pre_visibility = OutsideFrameMode::Hold;
+    layer0(&mut d).post_visibility = OutsideFrameMode::Hold;
+    assert_eq!(x(&d, 0), Some(0.0));
+    assert_eq!(x(&d, 4), Some(0.0));
+    assert_eq!(x(&d, 6), Some(0.0));
+    assert_eq!(x(&d, 8), Some(0.0));
+    layer0(&mut d).pre_visibility = OutsideFrameMode::Continue;
+    layer0(&mut d).post_visibility = OutsideFrameMode::Continue;
+    assert_eq!(x(&d, 4), Some(20.0), "before the first frame the graphic loops backwards");
+    assert_eq!(x(&d, 6), Some(10.0), "after the last frame graphic time keeps advancing");
+    assert_eq!(x(&d, 7), Some(20.0));
+    assert_eq!(x(&d, 8), Some(0.0));
+}
+
+#[test]
+fn pre_post_visibility_serde_defaults_off_and_round_trips() {
+    let l = Layer::new(LayerId(91), "Keyed");
+    let value = serde_json::to_value(&l).unwrap();
+    assert!(value.get("pre_visibility").is_none() && value.get("post_visibility").is_none());
+    let old: Layer = serde_json::from_value(value).unwrap();
+    assert_eq!(old.pre_visibility, OutsideFrameMode::Off);
+    assert_eq!(old.post_visibility, OutsideFrameMode::Off);
+    let mut changed = l;
+    changed.pre_visibility = OutsideFrameMode::Hold;
+    changed.post_visibility = OutsideFrameMode::Continue;
+    let value = serde_json::to_value(&changed).unwrap();
+    assert_eq!(value["pre_visibility"], "hold");
+    assert_eq!(value["post_visibility"], "continue");
+    let restored: Layer = serde_json::from_value(value).unwrap();
+    assert_eq!(changed, restored);
+}
+
+#[test]
+fn scene_duration_applies_post_visibility_to_movie_evaluation_and_all_exports() {
+    let mut d = Document::default();
+    let mut key = Keyframe::new(0, 2);
+    key.elements.push(Arc::new(shape_el(333, 1.0)));
+    let layer = layer0(&mut d);
+    layer.keyframes = vec![Arc::new(key)];
+    // Scene duration is independent from the last authored keyframe.
+    Arc::make_mut(&mut d.scenes[0]).duration_frames = 8;
+    assert_eq!(d.frame_count(), 8);
+    assert_eq!(d.scenes[0].frame_count(), 8);
+    assert_eq!(d.locate(6), (0, 6));
+    // evaluate(...) is the common movie/export path; evaluate_scene(...) is stage.
+    for f in [2, 6, 7] {
+        assert!(crate::evaluate(&d, f).items.is_empty(), "Off must hide the layer at {f}");
+        assert!(evaluate_scene(&d, 0, f).items.is_empty());
+    }
+    layer0(&mut d).post_visibility = OutsideFrameMode::Hold;
+    for f in [2, 6, 7] {
+        assert_eq!(crate::evaluate(&d, f).items.len(), 1, "Hold must keep artwork at {f}");
+        assert_eq!(evaluate_scene(&d, 0, f).items.len(), 1);
+    }
+    layer0(&mut d).post_visibility = OutsideFrameMode::Continue;
+    for f in [2, 6, 7] {
+        assert_eq!(crate::evaluate(&d, f).items.len(), 1, "Continue must keep artwork at {f}");
+        assert_eq!(evaluate_scene(&d, 0, f).items.len(), 1);
+    }
+    assert_eq!(d.locate(9), (0, 9), "out-of-range explicit render must not clamp to last scene frame");
+    let stored = serde_json::to_value(&d.scenes[0]).unwrap();
+    assert_eq!(stored["duration_frames"], 8);
+    let restored: crate::Scene = serde_json::from_value(stored).unwrap();
+    assert_eq!(restored.duration_frames, 8);
+}
+
+#[test]
+fn movie_frame_coordinates_honor_explicit_first_scene_duration() {
+    let mut d = Document::default();
+    Arc::make_mut(&mut d.scenes[0]).duration_frames = 12;
+    let mut second = crate::Scene::new("Second scene");
+    second.duration_frames = 5;
+    d.scenes.push(Arc::new(second));
+    assert_eq!(d.frame_count(), 17);
+    assert_eq!(d.locate(11), (0, 11));
+    assert_eq!(d.locate(12), (1, 0));
+    assert_eq!(d.locate(16), (1, 4));
+    assert_eq!(d.locate(18), (1, 6));
+    assert_eq!(d.scene_start(1), 12);
 }

@@ -334,6 +334,8 @@ impl PolyStarOptions {
 
 pub struct App {
     #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) remote: crate::remote::Remote,
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) updates: crate::updates::Updates,
     pub s: Session,
     pub tool: Tool,
@@ -629,6 +631,8 @@ impl App {
         // The editor draws as Animate does: merge drawing, until Object Drawing (J) is switched on.
         session.style.object_drawing = false;
         let mut app = App {
+            #[cfg(not(target_arch = "wasm32"))]
+            remote: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             updates: Default::default(),
             s: session,
@@ -2372,6 +2376,12 @@ impl App {
     /// The single entry point for user-initiated commands: asks first when the engine says the
     /// command needs confirmation (ADR 0004), otherwise runs it.
     pub fn request(&mut self, id: &str, params: Value) {
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        if matches!(id, "file.new" | "file.new_sample" | "file.new_from_template") {
+            crate::python::trace_document(&format!("request.begin:{id}"));
+        }
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        crate::python::trace("request.before_confirmation");
         if let Some(c) = self.s.confirmation(id, &params)
             && (c.irreversible || !self.skip_confirm.contains(id))
         {
@@ -2379,7 +2389,11 @@ impl App {
             self.confirm = Some(dialogs::PendingConfirm { id: id.to_string(), params, conf: c, dont_ask: false });
             return;
         }
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        crate::python::trace("request.before_perform");
         self.perform(id, params);
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        crate::python::trace("request.after_perform");
     }
 
     /// Runs a command and reports the outcome; routine destructive edits say how to undo.
@@ -2392,7 +2406,11 @@ impl App {
         let selected = self.s.selection.len();
         // A browser's autosaved copy opens as a file (ADR 0036): it is a restore all the same.
         let restored = autosave::restored_session(id, &params);
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        crate::python::trace("perform.before_engine_run");
         let v = self.run(id, params)?;
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        crate::python::trace("perform.after_engine_run");
         if let Some(session) = restored {
             self.view.fit = true;
             self.frame_sel = None;
@@ -2403,7 +2421,11 @@ impl App {
             self.status_ok(tr!("Restored “{name}”. It isn't saved yet: Save to keep it.", name = name));
             return Some(v);
         }
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        crate::python::trace("perform.before_announce");
         self.announce(id, &v, selected);
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        crate::python::trace("perform.after_announce");
         Some(v)
     }
 
@@ -2412,8 +2434,13 @@ impl App {
     pub(crate) fn announce(&mut self, id: &str, v: &Value, selected: usize) {
         match id {
             "file.new" | "file.new_sample" | "file.new_from_template" | "file.open" | "file.open_recent" => {
+                crate::movie_explorer::reset_editors(self);
                 // The document is here: the start screen has done its job (ADR 0059).
+                #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+                crate::python::trace("announce.before_start_none");
                 self.start = None;
+                #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+                crate::python::trace("announce.after_start_none");
                 if !id.starts_with("file.new")
                     && let Some(path) = self.s.path.clone().or_else(|| v["imported"].as_str().map(PathBuf::from))
                 {
@@ -2422,6 +2449,8 @@ impl App {
                 self.view.fit = true;
                 self.library_sel = crate::library::first_item(&self.s.doc);
                 self.decode_sounds();
+                #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+                crate::python::trace("announce.after_decode_sounds");
                 match v.get("report").and_then(Value::as_str) {
                     // An imported file: say what came across and what didn't, and that saving
                     // makes a new .anicraft document.
@@ -3374,6 +3403,8 @@ impl App {
                 return;
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::freeze_diag::mark(crate::freeze_diag::Phase::FrameBegin);
         self.handle_screenshot(&ctx);
         self.poll_font_scan(&ctx);
         self.follow_system_look(&ctx);
@@ -3411,6 +3442,30 @@ impl App {
         crate::warp_tool::upkeep(self);
         // An open button shows its hit area over its other states, in the theme's colour (ADR 0057).
         self.s.hit_area = Some(theme::hit_area());
+        #[cfg(not(target_arch = "wasm32"))]
+        let imported_from_bridge = {
+            let mut remote = std::mem::take(&mut self.remote);
+            let imported = remote.poll(self);
+            crate::freeze_diag::mark(crate::freeze_diag::Phase::RemoteDone);
+            self.remote = remote;
+            imported
+        };
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        {
+            // Avoid entering Python/Qt's nested native event pump in the same UI
+            // callback that decoded and replaced large SVG/bitmap resources.
+            // The next frame resumes normal Python processing.
+            if imported_from_bridge {
+                crate::python::trace("frame.python_tick.deferred_after_bridge_import");
+                ctx.request_repaint();
+            } else {
+                crate::freeze_diag::mark(crate::freeze_diag::Phase::PythonBegin);
+                crate::python::trace("frame.before_python_tick");
+                if crate::python::tick(self) { ctx.request_repaint_after(std::time::Duration::from_millis(16)); }
+                crate::python::trace("frame.after_python_tick");
+                crate::freeze_diag::mark(crate::freeze_diag::Phase::PythonDone);
+            }
+        }
         self.tick_playback(&ctx);
         self.scrub_sound();
         self.update_title(&ctx);
@@ -3425,11 +3480,27 @@ impl App {
         if self.start.is_some() {
             // The start screen takes the workspace's place (ADR 0059); the menus stay.
             egui::Panel::bottom("status_bar").exact_size(28.0).frame(bar(T.chrome)).show(ui, |ui| panels::status_bar(self, ui));
+            #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+            crate::python::trace("frame.start_screen.before");
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(T.pasteboard)).show(ui, |ui| crate::start::show(self, ui));
+            #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+            crate::python::trace("frame.start_screen.after");
         } else {
+            #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+            crate::python::trace("frame.workspace.before");
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::freeze_diag::mark(crate::freeze_diag::Phase::WorkspaceBegin);
             self.workspace(ui);
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::freeze_diag::mark(crate::freeze_diag::Phase::WorkspaceDone);
+            #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+            crate::python::trace("frame.workspace.after");
         }
         self.windows(&ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::freeze_diag::mark(crate::freeze_diag::Phase::FrameDone);
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        crate::python::trace_frame_done();
     }
 
     /// The editor's panels (ADR 0075): the edit bar and status bar, then the tools, the docks
@@ -3438,7 +3509,11 @@ impl App {
         let bar = |fill| egui::Frame::NONE.fill(fill).inner_margin(egui::Margin::symmetric(8, 2));
         egui::Panel::top("edit_bar").exact_size(theme::TARGET + 8.0).frame(bar(T.panel)).show(ui, |ui| panels::edit_bar(self, ui));
         egui::Panel::bottom("status_bar").exact_size(28.0).frame(bar(T.chrome)).show(ui, |ui| panels::status_bar(self, ui));
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        crate::python::trace("workspace.before_dock");
         crate::dock_ui::workspace(self, ui);
+        #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+        crate::python::trace("workspace.after_dock");
     }
 
     /// Dialogs and floating windows, the close guard and the end-of-frame upkeep.
@@ -3450,6 +3525,7 @@ impl App {
         crate::aids_dialog::window(self, &ctx);
         crate::templates::save_window(self, &ctx);
         crate::layer_props::window(self, &ctx);
+        crate::movie_explorer::editor_windows(self, &ctx);
         self.about_window(&ctx);
         dialogs::show_all(self, &ctx);
         autosave::window(self, &ctx);

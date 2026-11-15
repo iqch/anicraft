@@ -80,16 +80,20 @@ pub enum Icon {
     Plus,
     Trash,
     Copy,
+    SaveJson,
+    LoadJson,
     Ellipsis,
 }
 
 impl Icon {
     #[cfg(test)]
-    pub const ALL: [Icon; 67] = [
+    pub const ALL: [Icon; 69] = [
         Icon::Warp,
         Icon::Plus,
         Icon::Trash,
         Icon::Copy,
+        Icon::SaveJson,
+        Icon::LoadJson,
         Icon::Ellipsis,
         Icon::ClipStage,
         Icon::InsertFrame,
@@ -256,12 +260,16 @@ impl Icon {
             Icon::Plus => ("plus", false),
             Icon::Trash => ("trash", false),
             Icon::Copy => ("copy", false),
+            Icon::SaveJson => ("save_json", false),
+            Icon::LoadJson => ("load_json", false),
             Icon::Ellipsis => ("ellipsis", false),
         }
     }
 }
 
 static FILES: &[(&str, &str)] = &[
+    ("save_json", include_str!("../assets/icons/save_json.svg")),
+    ("load_json", include_str!("../assets/icons/load_json.svg")),
     ("mouse-pointer-2", include_str!("../assets/icons/mouse-pointer-2.svg")),
     ("navigation", include_str!("../assets/icons/navigation.svg")),
     ("scaling", include_str!("../assets/icons/scaling.svg")),

@@ -26,7 +26,7 @@
 //! skewed gradient transforms (approximated).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-use anicraft_doc::{Cap, Dash, ElementKind, GradientStop, Join, Paint, Rgba, Shape, Spread, Stroke, StrokeStyle, MAX_FOCAL};
+use anicraft_doc::{Bitmap, BitmapId, Cap, Dash, ElementKind, GradientStop, Join, Paint, Rgba, Shape, Spread, Stroke, StrokeStyle, MAX_FOCAL};
 use anicraft_geom::svg::parse_path_data;
 use anicraft_geom::{Affine, FillRule, Path, Rect, Vec2};
 use anicraft_text::{FaceMatch, Fonts};
@@ -44,6 +44,8 @@ mod clip_tests;
 mod tests;
 #[cfg(test)]
 mod text_tests;
+#[cfg(test)]
+mod image_tests;
 
 /// Most shapes read from one file.
 pub const MAX_SHAPES: usize = 200_000;
@@ -126,6 +128,13 @@ pub struct ImportedLayer {
     pub elements: Vec<ImportedElement>,
 }
 
+/// A bitmap embedded in SVG markup, with a provisional ID. The document importer
+/// remaps provisional IDs to fresh document-wide IDs before storing the artwork.
+#[derive(Clone, Debug)]
+pub struct ImportedBitmap {
+    pub bitmap: Bitmap,
+}
+
 /// An imported drawing. Coordinates are SVG user units (CSS pixels) of the drawing, with the
 /// `viewBox` already applied; `width` × `height` is its size.
 #[derive(Clone, Debug)]
@@ -134,13 +143,15 @@ pub struct SvgImport {
     pub height: f32,
     /// Bottom layer first. A drawing without clips or masks is one unmasked layer.
     pub layers: Vec<ImportedLayer>,
+    /// Embedded raster image resources used by bitmap-filled imported shapes.
+    pub bitmaps: Vec<ImportedBitmap>,
     pub report: Report,
 }
 
 impl SvgImport {
     /// A drawing of these elements on one layer.
     pub fn single(width: f32, height: f32, elements: Vec<ImportedElement>) -> SvgImport {
-        SvgImport { width, height, layers: vec![ImportedLayer { mask: None, elements }], report: Report::default() }
+        SvgImport { width, height, layers: vec![ImportedLayer { mask: None, elements }], bitmaps: Vec::new(), report: Report::default() }
     }
     /// Every element that draws (not mask artwork), bottom first.
     pub fn elements(&self) -> impl Iterator<Item = &ImportedElement> {
@@ -157,16 +168,23 @@ const TEXT_CONTENT: &[&str] = &["text", "tspan", "a", "textPath"];
 
 /// Reads an SVG document, laying any text out with this computer's fonts.
 pub fn import(bytes: &[u8]) -> Result<SvgImport, SvgError> {
-    import_from(bytes, None)
+    import_from(bytes, None, false)
 }
 
 /// Reads an SVG document, laying text out with `fonts` (tests, and hosts with their own font
 /// library).
 pub fn import_with_fonts(bytes: &[u8], fonts: &Fonts) -> Result<SvgImport, SvgError> {
-    import_from(bytes, Some(fonts))
+    import_from(bytes, Some(fonts), false)
 }
 
-fn import_from(bytes: &[u8], fonts: Option<&Fonts>) -> Result<SvgImport, SvgError> {
+/// Import SVG including self-contained PNG/JPEG images in `data:` URLs. External
+/// image paths are not loaded. Used by the VectorCraft bridge; ordinary SVG
+/// import keeps its previous image-reporting behaviour.
+pub fn import_with_images(bytes: &[u8]) -> Result<SvgImport, SvgError> {
+    import_from(bytes, None, true)
+}
+
+fn import_from(bytes: &[u8], fonts: Option<&Fonts>, images: bool) -> Result<SvgImport, SvgError> {
     let root = anicraft_xml::parse_mixed(bytes, TEXT_CONTENT)?;
     if local(&root.name) != "svg" {
         return Err(SvgError::NotSvg(root.name.clone()));
@@ -182,6 +200,8 @@ fn import_from(bytes: &[u8], fonts: Option<&Fonts>) -> Result<SvgImport, SvgErro
         ids,
         report: Report::default(),
         items: Vec::new(),
+        bitmaps: Vec::new(),
+        allow_images: images,
         viewport: vb.map_or((w, h), |r| (r.width(), r.height())),
         fonts,
         faces: HashMap::new(),
@@ -195,7 +215,7 @@ fn import_from(bytes: &[u8], fonts: Option<&Fonts>) -> Result<SvgImport, SvgErro
     let style = Style::default().with(&root, &mut b.report);
     b.children(&root, &base, &style, 1.0, 0, 0);
     let layers = b.layers();
-    Ok(SvgImport { width: w, height: h, layers, report: b.report })
+    Ok(SvgImport { width: w, height: h, layers, bitmaps: b.bitmaps, report: b.report })
 }
 
 /// The element's `id`, as an element name.
@@ -731,6 +751,8 @@ struct Builder<'a> {
     ids: HashMap<&'a str, &'a X>,
     report: Report,
     items: Vec<Item>,
+    bitmaps: Vec<ImportedBitmap>,
+    allow_images: bool,
     /// The size percentages refer to (the viewBox, or the drawing size).
     viewport: (f32, f32),
     /// The fonts text is laid out with; this computer's, found on the first text.
@@ -775,7 +797,7 @@ impl<'a> Builder<'a> {
                 self.report.skip("style sheets (inline styles are read)");
                 return;
             }
-            "image" => {
+            "image" if !self.allow_images => {
                 self.report.skip("images");
                 return;
             }
@@ -835,6 +857,7 @@ impl<'a> Builder<'a> {
                     self.node(target, &m, style, alpha, depth + 1, uses + 1);
                 }
             }
+            "image" => self.image(el, m, alpha, d),
             "text" => {
                 if hidden(d) {
                     return;
@@ -858,6 +881,74 @@ impl<'a> Builder<'a> {
                 self.items.push(Item { el: ImportedElement { name: name_of(el), transform: *m, alpha, kind: ElementKind::Shape(shape) }, clips: Vec::new() });
             }
         }
+    }
+
+    /// One PNG/JPEG image embedded in the document, represented as an editable
+    /// rectangular shape with a bitmap fill (not a rasterized vector).
+    fn image(&mut self, el: &X, m: &Affine, alpha: f32, d: &[(String, String)]) {
+        if hidden(d) || !m.is_finite() { return; }
+        let Some(href) = el.attr("href").or_else(|| el.attr("xlink:href")) else {
+            self.report.skip("images without embedded data");
+            return;
+        };
+        let Some((prefix, encoded)) = href.trim().split_once(',') else {
+            self.report.skip("externally linked images");
+            return;
+        };
+        if !["data:image/png;base64", "data:image/jpeg;base64", "data:image/jpg;base64"].iter().any(|mime| prefix.eq_ignore_ascii_case(mime)) {
+            self.report.skip("unsupported image formats");
+            return;
+        }
+        // Bound decoded storage and avoid accepting non-raster data URI schemes.
+        if encoded.len() > 48 * 1024 * 1024 {
+            self.report.skip("oversized embedded images");
+            return;
+        }
+        let Some(data) = anicraft_doc::base64_decode(encoded) else {
+            self.report.skip("invalid embedded image data");
+            return;
+        };
+        let id = BitmapId(self.bitmaps.len() as u64 + 1);
+        let Ok(bitmap) = Bitmap::from_image(id, name_of(el), data) else {
+            self.report.skip("unreadable embedded images");
+            return;
+        };
+        let (vw, vh) = self.viewport;
+        let read = |key: &str, reference: f32, default: f32| el.attr(key).and_then(|v| length(v, reference)).unwrap_or(default);
+        let (x, y) = (read("x", vw, 0.0), read("y", vh, 0.0));
+        let (w, h) = (read("width", vw, bitmap.width as f32), read("height", vh, bitmap.height as f32));
+        if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+            self.report.skip("images without valid dimensions");
+            return;
+        }
+        let (bw, bh) = (bitmap.width as f32, bitmap.height as f32);
+        let preserve = el.attr("preserveAspectRatio").unwrap_or("xMidYMid meet");
+        let (tx, ty, sx, sy) = if preserve.trim() == "none" {
+            (x, y, w / bw, h / bh)
+        } else {
+            if preserve.contains("slice") {
+                self.report.skip("image preserveAspectRatio slice");
+                return;
+            }
+            let scale = (w / bw).min(h / bh);
+            let dx = w - bw * scale;
+            let dy = h - bh * scale;
+            let ax = if preserve.contains("xMin") { 0.0 } else if preserve.contains("xMax") { dx } else { dx * 0.5 };
+            let ay = if preserve.contains("YMin") { 0.0 } else if preserve.contains("YMax") { dy } else { dy * 0.5 };
+            (x + ax, y + ay, scale, scale)
+        };
+        let transform = m.mul(&Affine::translate(tx, ty)).mul(&Affine::scale(sx, sy));
+        if !transform.is_finite() { self.report.skip("images with invalid transforms"); return; }
+        let shape = Shape {
+            path: Arc::new(Path::rect(0.0, 0.0, bw, bh)),
+            fill: Some(Paint::Bitmap { bitmap: id, repeat: false, matrix: Affine::IDENTITY }),
+            stroke: None,
+            fill_rule: FillRule::default(),
+            merge: false,
+            warp: None,
+        };
+        self.bitmaps.push(ImportedBitmap { bitmap });
+        self.items.push(Item { el: ImportedElement { name: name_of(el), transform, alpha, kind: ElementKind::Shape(shape) }, clips: Vec::new() });
     }
 
     /// The fonts to lay text out with: the ones given, else this computer's (scanned once).

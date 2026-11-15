@@ -220,7 +220,7 @@ pub fn edit_bar(app: &mut App, ui: &mut egui::Ui) {
         let name = app.s.doc.scenes.get(app.s.scene).map_or_else(|| tr!("Scene").to_string(), |s| s.name.clone());
         egui::ComboBox::from_id_salt("scene").selected_text(text(Type::Body, name).strong()).height(480.0).show_ui(ui, |ui| {
             ui.set_min_width(240.0);
-            let scenes: Vec<(String, u32)> = app.s.doc.scenes.iter().map(|s| (s.name.clone(), s.timeline.frame_count())).collect();
+            let scenes: Vec<(String, u32)> = app.s.doc.scenes.iter().map(|s| (s.name.clone(), s.frame_count())).collect();
             for (i, (n, frames)) in scenes.iter().enumerate() {
                 let r = ui.horizontal(|ui| {
                     let r = ui.selectable_label(i == app.s.scene, n.as_str());
