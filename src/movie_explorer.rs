@@ -335,8 +335,16 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
     let mut do_export = false;
     let mut do_import = false;
     ui.horizontal(|ui| {
-        let search_room = (ui.available_width() - 134.0).max(44.0);
-        let search = ui.add_sized([search_room, 24.0], egui::TextEdit::singleline(&mut app.explorer.filter).hint_text(tr!("Search")));
+        // Reserve room for the Show menu and our two JSON action buttons.
+        let menu_w_id = ui.id().with("explorer_show_w");
+        let menu_w = ui.data(|d| d.get_temp::<f32>(menu_w_id)).unwrap_or(72.0) + ui.spacing().item_spacing.x;
+        let json_buttons_w = if cfg!(target_arch = "wasm32") { 0.0 } else { 2.0 * (25.0 + ui.spacing().item_spacing.x) };
+
+        let search = ui.add(
+            egui::TextEdit::singleline(&mut app.explorer.filter)
+                .hint_text(tr!("Search"))
+                .desired_width((ui.available_width() - menu_w - json_buttons_w).max(crate::theme::MIN_FIELD))
+        );
         search.set_name(tr!("Search the Movie Explorer"));
         if search.changed() {
             app.explorer.changed();
@@ -366,6 +374,11 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                 app.explorer.changed();
             }
         });
+        let w = menu.response.rect.width();
+        if ui.data(|d| d.get_temp::<f32>(menu_w_id)) != Some(w) {
+            ui.data_mut(|d| d.insert_temp(menu_w_id, w));
+            ui.ctx().request_discard("the Show button's width changed"); // i18n-exempt: a debug reason, never shown
+        }
         menu.response.on_hover_text(tr!("What the Movie Explorer shows")).set_name(tr!("Show in the Movie Explorer"));
         #[cfg(not(target_arch = "wasm32"))]
         {

@@ -3,7 +3,7 @@
 
 use crate::params::*;
 use crate::{CommandSpec, EngineError, Result, Session};
-use anicraft_doc::{Element, ElementId, Keyframe, Layer, LayerId, MAX_SCENES, Scene, Timeline};
+use anicraft_doc::{ElementId, Layer, LayerId, MAX_SCENES, Scene, Timeline};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
