@@ -454,7 +454,7 @@ pub fn input(doc: &Document, state: &PlayerState, events: &[Event], host: &mut d
 /// drawing order (parents before their contents).
 pub fn tree(doc: &Document, st: &PlayerState) -> Vec<Node> {
     let tl = doc.timeline(st.scene);
-    let mut out = vec![Node { path: Vec::new(), parent: None, owner: 0, name: String::new(), symbol: None, kind: NodeKind::Root, frame: st.root.frame, frames: tl.frame_count(), xf: Affine::IDENTITY, local: Affine::IDENTITY, alpha: 1.0, hittable: true, events: Vec::new(), gain: 1.0, text: None }];
+    let mut out = vec![Node { path: Vec::new(), parent: None, owner: 0, name: String::new(), symbol: None, kind: NodeKind::Root, frame: st.root.frame, frames: doc.scenes[st.scene].frame_count(), xf: Affine::IDENTITY, local: Affine::IDENTITY, alpha: 1.0, hittable: true, events: Vec::new(), gain: 1.0, text: None }];
     // The main timeline is seen through its camera (ADR 0027): instances are where the pointer
     // sees them.
     let camera = tl.camera_at(st.root.frame, &doc.stage);
@@ -573,7 +573,9 @@ fn walk(doc: &Document, st: &PlayerState, tl: &Timeline, frame: u32, parent: usi
         let gain = parent_gain * layer.sound_gain();
         let hit = hittable && layer.kind != LayerKind::Mask;
         let path_walk = layer.parent.and_then(|p| tl.layer(p)).filter(|g| g.kind == LayerKind::Guide).and_then(|g| guide_walk(g, frame));
-        let Some((kf_start, els)) = evaluate_shown(layer, frame, path_walk.as_ref(), doc.stage.fps) else { continue };
+        let Some(drawn_frame) = layer.displayed_frame(frame) else { continue };
+        let Some((kf_start, els)) = evaluate_shown(layer, drawn_frame, path_walk.as_ref(), doc.stage.fps) else { continue };
+        let clock = layer.display_clock(frame).unwrap_or(frame);
         let layer_xf = match camera {
             Some(c) => match c.layer_view(&doc.stage, layer, frame) {
                 Some(v) => v,
@@ -610,7 +612,7 @@ fn walk(doc: &Document, st: &PlayerState, tl: &Timeline, frame: u32, parent: usi
             let e: &Element = set.as_ref().unwrap_or(el);
             let len = sym.timeline.frame_count();
             let (kind, local) = match sym.kind {
-                SymbolKind::Graphic => (NodeKind::Graphic, loop_mode.local_frame(frame.saturating_sub(kf_start), *first_frame, len)),
+                SymbolKind::Graphic => (NodeKind::Graphic, crate::eval::graphic_frame(*loop_mode, clock, kf_start, *first_frame, len)),
                 SymbolKind::MovieClip => (NodeKind::MovieClip, st.clip_frame(&path, len)),
                 SymbolKind::Button => (NodeKind::Button, st.button_frame(&path, len)),
             };
@@ -776,7 +778,7 @@ impl<'a, 'h> Run<'a, 'h> {
         if self.st.scene >= self.doc.scenes.len() {
             self.st.scene = 0;
         }
-        let n = self.doc.timeline(self.st.scene).frame_count();
+        let n = self.doc.scenes[self.st.scene].frame_count();
         self.st.root.frame = self.st.root.frame.min(n.saturating_sub(1));
         self.nodes = tree(self.doc, &self.st);
         let live: std::collections::BTreeSet<&InstancePath> = self.nodes.iter().filter(|n| n.kind == NodeKind::MovieClip).map(|n| &n.path).collect();
@@ -826,7 +828,7 @@ impl<'a, 'h> Run<'a, 'h> {
     /// of one (and back to the first at the end of the movie), movie clips round their loop.
     fn advance(&mut self) {
         if self.st.root.playing {
-            let n = self.doc.timeline(self.st.scene).frame_count();
+            let n = self.doc.scenes[self.st.scene].frame_count();
             let (scene, frame) = if self.st.root.frame + 1 < n {
                 (self.st.scene, self.st.root.frame + 1)
             } else if self.st.scene + 1 < self.doc.scenes.len() {
@@ -1090,7 +1092,7 @@ impl<'a, 'h> Run<'a, 'h> {
                 Prop::Alpha | Prop::ScaleX | Prop::ScaleY => num(1.0),
                 Prop::Visible => Ok(Value::Bool(true)),
                 Prop::CurrentFrame => num(f64::from(self.st.root.frame) + 1.0),
-                Prop::TotalFrames => num(self.doc.scenes.iter().map(|s| f64::from(s.timeline.frame_count())).sum()),
+                Prop::TotalFrames => num(f64::from(self.doc.frame_count())),
                 Prop::CurrentLabel => Ok(current_label(self.doc.timeline(self.st.scene), self.st.root.frame)),
                 Prop::MouseX => num(short(self.st.mouse.x)),
                 Prop::MouseY => num(short(self.st.mouse.y)),
@@ -1292,7 +1294,7 @@ impl<'a, 'h> Run<'a, 'h> {
             (None, self.timeline_of(i).ok_or("not a timeline")?)
         };
         match to {
-            FrameRef::Number(n) => Ok((scene_ix, (*n).min(tl.frame_count().saturating_sub(1)))),
+            FrameRef::Number(n) => Ok((scene_ix, (*n).min(scene_ix.map_or_else(|| tl.frame_count(), |i| self.doc.scenes[i].frame_count()).saturating_sub(1)))),
             FrameRef::Label(l) => {
                 if let Some(f) = find_label(tl, l) {
                     return Ok((scene_ix, f));

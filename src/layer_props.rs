@@ -7,7 +7,7 @@
 use crate::a11y::Named;
 use crate::app::App;
 use crate::theme::{FORM_LABEL_DIALOG, Type, form_row, text, to_color32};
-use anicraft_engine::doc::{LayerId, LayerKind, MAX_LAYER_HEIGHT, Rgba};
+use anicraft_engine::doc::{LayerId, LayerKind, MAX_LAYER_HEIGHT, OutsideFrameMode, Rgba};
 use egui::Key;
 use serde_json::{Value, json};
 
@@ -16,6 +16,8 @@ pub struct LayerPropsDialog {
     pub layer: LayerId,
     pub name: String,
     pub visible: bool,
+    pub pre_visibility: OutsideFrameMode,
+    pub post_visibility: OutsideFrameMode,
     pub locked: bool,
     /// `normal`, `mask`, `masked`, `guide`, `guided`, or a kind that can't change (`folder`,
     /// `camera`, `armature`).
@@ -48,6 +50,8 @@ pub fn open(app: &mut App, layer: Option<LayerId>) {
         layer: id,
         name: l.name.clone(),
         visible: l.visible,
+        pre_visibility: l.pre_visibility,
+        post_visibility: l.post_visibility,
         locked: l.locked,
         ty: p.get("type").and_then(Value::as_str).unwrap_or("normal").to_string(),
         color: [c.r(), c.g(), c.b()],
@@ -68,10 +72,25 @@ fn types() -> [(&'static str, &'static str); 5] {
 /// The mask types, with their names and what each does.
 fn mask_types() -> [(&'static str, &'static str, &'static str); 3] {
     [
-        ("coverage", tr!("Shape"), tr!("The mask's fills reveal fully, whatever their colour or opacity (as in Animate)")),
+        ("coverage", tr!("Shape"), tr!("The mask's fills reveal fully, whatever their colour or opacity")),
         ("alpha", tr!("Alpha"), tr!("The mask's opacity reveals: gradients to transparent and faded shapes give soft edges")),
         ("luminance", tr!("Luminance"), tr!("The mask's brightness reveals: white shows, black hides, greys show partly")),
     ]
+}
+
+/// Visibility outside a layer's authored frames. Only symbol time differs between Hold
+/// and Continue; the visible artwork stays the first or last authored keyframe.
+fn outside_mode(ui: &mut egui::Ui, id: &'static str, mode: &mut OutsideFrameMode) {
+    let label = |value: OutsideFrameMode| match value {
+        OutsideFrameMode::Off => tr!("Off"),
+        OutsideFrameMode::Hold => tr!("Hold"),
+        OutsideFrameMode::Continue => tr!("Continue"),
+    };
+    egui::ComboBox::from_id_salt(id).width(116.0).selected_text(label(*mode)).show_ui(ui, |ui| {
+        for value in OutsideFrameMode::ALL {
+            ui.selectable_value(mode, value, label(value));
+        }
+    }).response.on_hover_text(tr!("Off: hide outside frames. Hold: show the boundary artwork with frozen symbol animation. Continue: show boundary artwork with running symbol animation. Gaps inside the timeline remain empty."));
 }
 
 fn type_label(ty: &str) -> &'static str {
@@ -114,6 +133,14 @@ pub fn window(app: &mut App, ctx: &egui::Context) {
             crate::theme::checkbox(ui, &mut d.visible, tr!("Show"));
             crate::theme::checkbox(ui, &mut d.locked, tr!("Lock"));
         });
+        if !matches!(kind, LayerKind::Folder | LayerKind::Camera) {
+            form_row(ui, FORM_LABEL_DIALOG, tr!("Before first frame"), |ui| {
+                outside_mode(ui, "layer_pre_visibility", &mut d.pre_visibility);
+            });
+            form_row(ui, FORM_LABEL_DIALOG, tr!("After last frame"), |ui| {
+                outside_mode(ui, "layer_post_visibility", &mut d.post_visibility);
+            });
+        }
         form_row(ui, FORM_LABEL_DIALOG, tr!("Type"), |ui| {
             if fixed {
                 ui.label(text(Type::Body, type_label(&d.ty)));
@@ -200,6 +227,8 @@ pub fn changes(d: &LayerPropsDialog) -> Value {
     let now = json!({
         "name": d.name.trim(),
         "visible": d.visible,
+        "pre_visibility": d.pre_visibility.key(),
+        "post_visibility": d.post_visibility.key(),
         "locked": d.locked,
         "type": d.ty,
         "color": color,

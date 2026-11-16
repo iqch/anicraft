@@ -9,7 +9,7 @@
 
 use crate::params::*;
 use crate::{CommandSpec, EngineError, Result, Session};
-use anicraft_doc::{Layer, LayerId, LayerKind, MAX_LAYER_HEIGHT, MaskMode};
+use anicraft_doc::{Layer, LayerId, LayerKind, MAX_LAYER_HEIGHT, MaskMode, OutsideFrameMode};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Mask Type",
             "",
             None,
-            "{mask: coverage|alpha|luminance, layer?} how a mask layer reveals the layers it masks: coverage (its fills' area, as in Animate), alpha (its artwork's opacity: gradients and faded shapes make soft edges) or luminance (its brightness: white shows, black hides; SVG's mask) (ADR 0070)",
+            "{mask: coverage|alpha|luminance, layer?} how a mask layer reveals the layers it masks: coverage (its fills' area), alpha (its artwork's opacity: gradients and faded shapes make soft edges) or luminance (its brightness: white shows, black hides; SVG's mask) (ADR 0070)",
             true,
             set_mask,
         ),
@@ -45,11 +45,11 @@ pub fn specs() -> Vec<CommandSpec> {
             "Layer Properties",
             "Modify/Timeline",
             None,
-            "{layer?, name?, type?: normal|mask|masked|guide|guided, mask?: coverage|alpha|luminance (a mask layer's mask type), color?, outline?: bool (view as outlines), height?: 100|200|300, visible?, locked?, onion?} sets several at once, as one undo step; answers with the layer's properties",
+            "{layer?, name?, type?: normal|mask|masked|guide|guided, mask?: coverage|alpha|luminance (a mask layer's mask type), color?, outline?: bool (view as outlines), height?: 100|200|300, visible?, pre_visibility?: off|hold|continue, post_visibility?: off|hold|continue, locked?, onion?} sets several at once, as one undo step; answers with the layer's properties",
             true,
             set_properties,
         ),
-        c("layer.properties", "Get Layer Properties", "", None, "{layer?} the layer's name, type, mask type (mask layers), colour, outline, height (percent), visible, locked and onion", false, |s, p| properties(s, layer_id(s, p)?)),
+        c("layer.properties", "Get Layer Properties", "", None, "{layer?} the layer's name, type, mask type (mask layers), colour, outline, height (percent), visible, pre_visibility, post_visibility, locked and onion", false, |s, p| properties(s, layer_id(s, p)?)),
     ]
 }
 
@@ -141,6 +141,10 @@ fn set_properties(s: &mut Session, p: &Value) -> Result<Value> {
     let height = height_param(p)?;
     let mask = mask_param(p)?;
     let (visible, locked, onion) = (opt_bool(p, "visible")?, opt_bool(p, "locked")?, opt_bool(p, "onion")?);
+    let parse_visibility = |key: &str| -> Result<Option<OutsideFrameMode>> {
+        opt_str(p, key)?.map(|name| OutsideFrameMode::from_key(name).ok_or_else(|| EngineError::Param(format!("'{key}' must be off, hold, or continue")))).transpose()
+    };
+    let (pre_visibility, post_visibility) = (parse_visibility("pre_visibility")?, parse_visibility("post_visibility")?);
     if let Some(ty) = ty {
         let now = crate::cmds_timeline::layer_type_json(s, id);
         if now.get("type").and_then(Value::as_str) != Some(ty) {
@@ -169,6 +173,12 @@ fn set_properties(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(v) = visible {
         l.visible = v;
     }
+    if let Some(v) = pre_visibility {
+        l.pre_visibility = v;
+    }
+    if let Some(v) = post_visibility {
+        l.post_visibility = v;
+    }
     if let Some(v) = locked {
         l.locked = v;
     }
@@ -190,6 +200,8 @@ fn properties(s: &Session, id: LayerId) -> Result<Value> {
         "outline": l.outline,
         "height": u32::from(l.height()) * 100,
         "visible": l.visible,
+        "pre_visibility": l.pre_visibility.key(),
+        "post_visibility": l.post_visibility.key(),
         "locked": l.locked,
         "onion": l.onion,
     }))

@@ -38,6 +38,7 @@ pub fn specs() -> Vec<CommandSpec> {
             run: import_to_stage,
         },
         CommandSpec { id: "file.export_svg", label: "Export Frame as SVG…", menu: "File/Export", shortcut: None, params: "{path, frame? (in the current scene), confirm?}", mutates: false, run: export_svg },
+        CommandSpec { id: "bridge.import_svg", label: "Import SVG from VectorCraft", menu: "", shortcut: None, params: "{svg: UTF-8 SVG (max 48 MiB), x?, y?, mode?: update | copy | raw, isGroup?: bool, sourceDocument?, sourceObject?, sourceName?} one selected VC root; update linked AC symbols without moving instances, copy a new linked Graphic Symbol, or import raw shapes (groups always symbols)", mutates: true, run: bridge_import_svg },
         CommandSpec {
             id: "file.export_video",
             label: "Export Video…",
@@ -212,6 +213,8 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
         info["kept"] = json!(report.kept);
         info["runs"] = json!(report.runs);
         info["missing_fonts"] = json!(report.missing_fonts);
+        // The sounds and videos that didn't come across, by name and why (ADR 0086).
+        info["named"] = json!(report.names);
         info["merged_keyframes"] = json!(merged);
         return Ok(info);
     }
@@ -790,7 +793,8 @@ pub fn gif_delays(frames: usize, fps: f32) -> Vec<u16> {
         .collect()
 }
 
-/// The movie as a Lottie (JSON) animation, frame-accurate (see `anicraft_render::lottie`).
+/// The movie as a Lottie (JSON) animation, keyed with eases and equal to `evaluate` at every
+/// frame (see `anicraft_render::lottie`, ADR 0089).
 fn export_lottie(s: &mut Session, p: &Value) -> Result<Value> {
     let path = PathBuf::from(str_req(p, "path")?);
     let last = s.doc.frame_count().saturating_sub(1);
@@ -871,26 +875,25 @@ fn export_gif(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = &s.doc;
     let job = s.job.as_deref();
     let delays = gif_delays(n as usize, doc.stage.fps);
-    let frames: Vec<gif::Frame<'static>> = (from..to.saturating_add(1))
+    let frames: Vec<(craft_gif::write::PreparedFrame, u16)> = (from..to.saturating_add(1))
         .into_par_iter()
         .zip(delays.into_par_iter())
         .map(|(f, delay)| {
             let (pm, _) = render(&anicraft_doc::evaluate(doc, f), &view)?;
-            let mut rgba = pm.to_rgba8();
-            let mut frame = gif::Frame::from_rgba_speed(w, h, &mut rgba, 10);
-            frame.delay = delay;
+            let rgba = pm.to_rgba8();
+            let frame = craft_gif::write::prepare_frame(u32::from(w), u32::from(h), rgba, 10)
+                .map_err(|e| EngineError::Format(e.to_string()))?;
             crate::publish::tick(job, 1)?;
-            Ok(frame)
+            Ok((frame, delay))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut bytes = Vec::new();
     {
-        let mut enc = gif::Encoder::new(&mut bytes, w, h, &[]).map_err(|e| EngineError::Format(e.to_string()))?;
-        if looping {
-            enc.set_repeat(gif::Repeat::Infinite).map_err(|e| EngineError::Format(e.to_string()))?;
-        }
-        for fr in &frames {
-            enc.write_frame(fr).map_err(|e| EngineError::Format(e.to_string()))?;
+        let opts = craft_gif::write::Options { loop_forever: looping, ..Default::default() };
+        let mut enc = craft_gif::write::AnimationWriter::new(&mut bytes, u32::from(w), u32::from(h), opts)
+            .map_err(|e| EngineError::Format(e.to_string()))?;
+        for (fr, delay) in frames {
+            enc.write_prepared_frame(fr, delay).map_err(|e| EngineError::Format(e.to_string()))?;
         }
     }
     crate::vfs::write(&path, &bytes)?;
@@ -906,4 +909,233 @@ fn set_stage(s: &mut Session, p: &Value) -> Result<Value> {
         s.doc.stage.background = c;
     }
     Ok(json!({"width": s.doc.stage.width, "height": s.doc.stage.height, "fps": s.doc.stage.fps, "background": s.doc.stage.background.to_hex()}))
+}
+
+/// VectorCraft → AniCraft. One selected root at a time, with an optional persistent
+/// source identity. `update` refreshes *all* linked symbol definitions in place, not
+/// their instances; `copy` places a new linked symbol; `raw` places individual
+/// shapes unless the selected root was a group (groups always stay one symbol).
+/// Without `mode`, use the original legacy vector/bitmap import behaviour.
+fn bridge_import_svg(s: &mut Session, p: &Value) -> Result<Value> {
+    use std::collections::{HashMap, HashSet};
+    use anicraft_doc::{BitmapId, Element, ElementId, ElementKind, Keyframe, Layer, LayerId, LayerKind, LibraryItem, LoopMode, Paint, Symbol, SymbolId, SymbolKind, Timeline};
+    const MAX_SVG: usize = 48 * 1024 * 1024;
+    const META_KEY: &str = "_vectorcraft_symbol_sources_v1";
+
+    let svg = str_req(p, "svg")?;
+    if svg.is_empty() || svg.len() > MAX_SVG {
+        return Err(EngineError::Param("svg must contain 1..48 MiB of UTF-8 SVG markup".into()));
+    }
+    let mode = match p.get("mode") {
+        None | Some(Value::Null) => "legacy",
+        Some(Value::String(value)) if matches!(value.as_str(), "update" | "copy" | "raw") => value.as_str(),
+        _ => return Err(EngineError::Param("mode must be update, copy, or raw".into())),
+    };
+    let is_group = match p.get("isGroup") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        _ => return Err(EngineError::Param("isGroup must be a boolean".into())),
+    };
+    // The group rule wins over raw: its complete drawing remains one graphic symbol.
+    let effective_mode = if is_group && mode == "raw" { "copy" } else { mode };
+    let source_key = if matches!(effective_mode, "update" | "copy") {
+        let document = str_req(p, "sourceDocument")?;
+        let id = p.get("sourceObject").and_then(Value::as_u64).filter(|id| *id > 0)
+            .ok_or_else(|| EngineError::Param("sourceObject must be a positive VC object ID".into()))?;
+        if document.is_empty() || document.len() > 4096 {
+            return Err(EngineError::Param("sourceDocument must be a nonempty identifier up to 4096 bytes".into()));
+        }
+        if !s.doc.user_metadata.is_null() && !s.doc.user_metadata.is_object() {
+            return Err(EngineError::State("document metadata must be an object for linked VC symbols".into()));
+        }
+        if s.doc.user_metadata.get(META_KEY).is_some_and(|value| !value.is_object()) {
+            return Err(EngineError::State("VC link metadata must be a JSON object".into()));
+        }
+        Some(json!([document, id]).to_string())
+    } else {
+        None
+    };
+    let name = p.get("sourceName").and_then(Value::as_str).filter(|name| !name.trim().is_empty())
+        .map_or("VectorCraft artwork", str::trim);
+    if name.len() > 512 { return Err(EngineError::Param("sourceName exceeds 512 bytes".into())); }
+
+    let drawing = anicraft_svg::import_with_images(svg.as_bytes()).map_err(|e| EngineError::Format(format!("SVG bridge: {e}")))?;
+    if drawing.is_empty() {
+        return Err(EngineError::State(format!("SVG bridge has no importable artwork: {}", drawing.report.summary())));
+    }
+    if !drawing.report.skipped.is_empty() {
+        return Err(EngineError::State(format!("SVG bridge would drop content: {}", drawing.report.summary())));
+    }
+    let x = opt_f32(p, "x")?.unwrap_or((s.doc.stage.width as f32 - drawing.width) * 0.5);
+    let y = opt_f32(p, "y")?.unwrap_or((s.doc.stage.height as f32 - drawing.height) * 0.5);
+    if !(x.is_finite() && y.is_finite()) { return Err(EngineError::Param("placement must be finite".into())); }
+    // An update of an existing definition does not need an editable active layer.
+    // Every operation that places artwork does, and is validated before allocation.
+    let mut linked: Vec<SymbolId> = source_key.as_deref()
+        .and_then(|key| s.doc.user_metadata.get(META_KEY)?.get(key)?.as_array())
+        .map(|values| values.iter().filter_map(Value::as_u64).map(SymbolId).filter(|id| s.doc.symbol(*id).is_some()).collect())
+        .unwrap_or_default();
+    linked.sort_by_key(|id| id.0);
+    linked.dedup();
+    let refresh = effective_mode == "update" && !linked.is_empty();
+    if !refresh { let _ = s.editable_keyframe()?; }
+
+    let place = anicraft_geom::Affine::translate(x, y);
+    let count = drawing.elements().count();
+    let raster_count = drawing.bitmaps.len();
+    let mask_count = drawing.layers.iter().filter(|layer| layer.mask.is_some()).count();
+    let (width, height, report) = (drawing.width, drawing.height, drawing.report.summary());
+    let layer_id = s.layer;
+    let mut bitmap_ids: HashMap<BitmapId, BitmapId> = HashMap::new();
+    for imported in drawing.bitmaps {
+        let mut bitmap = imported.bitmap;
+        let old = bitmap.id;
+        let new = BitmapId(s.doc.alloc_id());
+        bitmap.id = new;
+        s.doc.bitmaps.push(Arc::new(bitmap));
+        bitmap_ids.insert(old, new);
+    }
+    let make_elements = |s: &mut Session, input: Vec<anicraft_svg::ImportedElement>| -> Vec<Arc<Element>> {
+        input.into_iter().map(|element| {
+            let mut kind = element.kind;
+            if let ElementKind::Shape(shape) = &mut kind {
+                if let Some(Paint::Bitmap { bitmap, .. }) = &mut shape.fill {
+                    if let Some(mapped) = bitmap_ids.get(bitmap) { *bitmap = *mapped; }
+                }
+            }
+            Arc::new(Element { id: ElementId(s.doc.alloc_id()), name: element.name, transform: element.transform, color: anicraft_doc::ColorEffect::opacity(element.alpha), kind })
+        }).collect()
+    };
+    let template_layers = drawing.layers;
+    if matches!(effective_mode, "update" | "copy") {
+        let make_timeline = |s: &mut Session| -> Timeline {
+            let mut layers = Vec::new();
+            let runs = template_layers.len();
+            for (n, imported) in template_layers.iter().cloned().enumerate().rev() {
+                let mut parent = None;
+                if let Some(mask) = imported.mask {
+                    let mut ml = Layer::new(LayerId(s.doc.alloc_id()), if mask.name.is_empty() { "Mask".into() } else { mask.name });
+                    ml.kind = LayerKind::Mask;
+                    ml.locked = true;
+                    ml.mask_mode = mask.mode;
+                    let mut key = Keyframe::new(0, 1);
+                    key.elements = make_elements(s, mask.elements);
+                    ml.keyframes = vec![Arc::new(key)];
+                    parent = Some(ml.id);
+                    layers.push(Arc::new(ml));
+                }
+                let label = if runs == 1 { "Artwork".to_string() } else { format!("Artwork {}", n + 1) };
+                let mut art = Layer::new(LayerId(s.doc.alloc_id()), label);
+                art.parent = parent;
+                let mut key = Keyframe::new(0, 1);
+                key.elements = make_elements(s, imported.elements);
+                art.keyframes = vec![Arc::new(key)];
+                layers.push(Arc::new(art));
+            }
+            let mut timeline = Timeline { layers };
+            timeline.repair_masks();
+            timeline
+        };
+        if refresh {
+            // Keep symbol ID, name, linkage and every placed instance. Only artwork
+            // within the definition changes, including its bitmap references.
+            let mut old_bitmaps: HashSet<BitmapId> = HashSet::new();
+            for id in &linked {
+                if let Some(sym) = s.doc.symbol(*id) {
+                    for layer in &sym.timeline.layers {
+                        for key in &layer.keyframes {
+                            for element in &key.elements {
+                                if let ElementKind::Shape(shape) = &element.kind {
+                                    if let Some(Paint::Bitmap { bitmap, .. }) = &shape.fill { old_bitmaps.insert(*bitmap); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for id in &linked {
+                let timeline = make_timeline(s);
+                if let Some(symbol) = s.doc.library.iter_mut().find(|symbol| symbol.id == *id) {
+                    Arc::make_mut(symbol).timeline = timeline;
+                }
+            }
+            // Reclaim only bitmaps formerly referenced by the replaced definitions,
+            // and only if no other scene or symbol still uses them.
+            let uses = s.doc.library_uses();
+            s.doc.bitmaps.retain(|bitmap| !old_bitmaps.contains(&bitmap.id) || uses.contains_key(&LibraryItem::Bitmap(bitmap.id)));
+            return Ok(json!({"mode":"update", "updatedSymbols":linked.iter().map(|id| id.0).collect::<Vec<_>>(), "createdSymbols":[], "placed":false,
+                "symbols":linked.iter().map(|id| id.0).collect::<Vec<_>>(), "symbol":linked.first().map(|id| id.0),
+                "elements":count, "bitmaps":raster_count, "masks":mask_count, "layer":layer_id.0,
+                "scene":s.scene, "frame":s.frame, "width":width, "height":height, "report":report}));
+        }
+        let timeline = make_timeline(s);
+        let symbol_id = SymbolId(s.doc.alloc_id());
+        let name = s.doc.unique_name(None, name);
+        s.doc.library.push(Arc::new(Symbol { id:symbol_id, name:name.clone(), kind:SymbolKind::Graphic, linkage:None,
+            scale_grid:None, scale_grid_kept:None, timeline }));
+        let instance_id = ElementId(s.doc.alloc_id());
+        s.editable_keyframe()?.elements.push(Arc::new(Element { id:instance_id, name:name.clone(), transform:place,
+            color:anicraft_doc::ColorEffect::default(), kind:ElementKind::Symbol { symbol:symbol_id,
+            loop_mode:LoopMode::default(), first_frame:0, blend:anicraft_doc::BlendMode::default(), filters:Vec::new(), events:Vec::new() } }));
+        s.select_only([instance_id]);
+        if let Some(key) = source_key {
+            if s.doc.user_metadata.is_null() { s.doc.user_metadata = json!({}); }
+            let Some(root) = s.doc.user_metadata.as_object_mut() else { return Err(EngineError::State("invalid document metadata".into())); };
+            let links = root.entry(META_KEY).or_insert_with(|| json!({}));
+            let Some(map) = links.as_object_mut() else { return Err(EngineError::State("invalid VC link metadata".into())); };
+            let entry = map.entry(key).or_insert_with(|| json!([]));
+            if !entry.is_array() { *entry = json!([]); }
+            if let Some(array) = entry.as_array_mut() { array.push(json!(symbol_id.0)); }
+        }
+        return Ok(json!({"mode":effective_mode,"updatedSymbols":[],"createdSymbols":[symbol_id.0],"placed":true,
+            "symbols":[symbol_id.0], "symbol":symbol_id.0,"instance":instance_id.0,"elements":count,
+            "bitmaps":raster_count,"masks":mask_count,"layer":layer_id.0,"scene":s.scene,"frame":s.frame,
+            "width":width,"height":height,"report":report}));
+    }
+    // Backwards-compatible raw import (including the pre-bridge masked-symbol path).
+    if mask_count == 0 {
+        let mut elements = Vec::new();
+        for layer in template_layers {
+            elements.extend(make_elements(s, layer.elements).into_iter().map(|e| Arc::new(Element { transform:place.mul(&e.transform), ..(*e).clone() })));
+        }
+        let ids: Vec<ElementId> = elements.iter().map(|e| e.id).collect();
+        s.editable_keyframe()?.elements.extend(elements);
+        s.select_only(ids);
+        return Ok(json!({"mode":"raw","elements":count,"bitmaps":raster_count,"masks":0,"symbol":null,
+            "layer":layer_id.0,"scene":s.scene,"frame":s.frame,"width":width,"height":height,"report":report}));
+    }
+    let mut layers = Vec::new();
+    let runs = template_layers.len();
+    for (n, imported) in template_layers.into_iter().enumerate().rev() {
+        let mut parent = None;
+        if let Some(mask) = imported.mask {
+            let mut ml = Layer::new(LayerId(s.doc.alloc_id()), if mask.name.is_empty() { "Mask".into() } else { mask.name });
+            ml.kind = LayerKind::Mask;
+            ml.locked = true;
+            ml.mask_mode = mask.mode;
+            let mut key = Keyframe::new(0, 1);
+            key.elements = make_elements(s, mask.elements);
+            ml.keyframes = vec![Arc::new(key)];
+            parent = Some(ml.id);
+            layers.push(Arc::new(ml));
+        }
+        let mut art = Layer::new(LayerId(s.doc.alloc_id()), if runs == 1 { "Artwork".into() } else { format!("Artwork {}", n + 1) });
+        art.parent = parent;
+        let mut key = Keyframe::new(0, 1);
+        key.elements = make_elements(s, imported.elements);
+        art.keyframes = vec![Arc::new(key)];
+        layers.push(Arc::new(art));
+    }
+    let mut timeline = Timeline { layers };
+    timeline.repair_masks();
+    let symbol_id = SymbolId(s.doc.alloc_id());
+    s.doc.library.push(Arc::new(Symbol { id:symbol_id,name:"VectorCraft artwork".into(),kind:SymbolKind::Graphic,
+        linkage:None,scale_grid:None,scale_grid_kept:None,timeline }));
+    let instance_id = ElementId(s.doc.alloc_id());
+    s.editable_keyframe()?.elements.push(Arc::new(Element { id:instance_id,name:"VectorCraft artwork".into(),transform:place,
+        color:anicraft_doc::ColorEffect::default(),kind:ElementKind::Symbol { symbol:symbol_id,
+        loop_mode:LoopMode::default(),first_frame:0,blend:anicraft_doc::BlendMode::default(),filters:Vec::new(),events:Vec::new() } }));
+    s.select_only([instance_id]);
+    Ok(json!({"mode":"legacy","elements":count,"bitmaps":raster_count,"masks":mask_count,"symbol":symbol_id.0,
+        "layer":layer_id.0,"scene":s.scene,"frame":s.frame,"width":width,"height":height,"report":report}))
 }

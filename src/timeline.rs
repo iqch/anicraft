@@ -11,6 +11,9 @@ use serde_json::json;
 use std::sync::Arc;
 
 const LAYER_W: f32 = 252.0;
+/// The narrowest the layer column goes, and the least room kept for frames beside it.
+const MIN_LAYER_W: f32 = 150.0;
+const MIN_FRAMES_W: f32 = 40.0;
 /// Rows are click targets (≥ `theme::TARGET`).
 const ROW_H: f32 = TARGET;
 const RULER_H: f32 = 24.0;
@@ -313,6 +316,7 @@ fn transport(app: &mut App, ui: &mut egui::Ui) {
     if icon_button(ui, tr!("Loop playback"), Some(looping), Icon::Loop).clicked() {
         app.looping = !app.looping;
     }
+    volume(app, ui);
     crate::onion::buttons(app, ui);
     // Add Camera, as Animate has it on the timeline: on while the scene has a camera; a click
     // then takes it away (asking first when the camera moves; undoable).
@@ -327,6 +331,40 @@ fn transport(app: &mut App, ui: &mut egui::Ui) {
         }
     }
 }
+
+/// The monitor volume (ADR 0095): a speaker that mutes and a short slider, for playback,
+/// scrubbing, previews and Test Movie. The listener's (kept in the preferences), never the
+/// document's: exports keep their sound. Layer volumes are in Properties.
+fn volume(app: &mut App, ui: &mut egui::Ui) {
+    let muted = app.prefs.sound_muted;
+    let tip = if muted { tr!("Unmute sounds") } else { tr!("Mute sounds (while you work; exports keep their sound)") };
+    if icon_button(ui, tip, Some(muted), if muted { Icon::SoundOff } else { Icon::Sound }).clicked() {
+        app.prefs.sound_muted = !muted;
+        app.save_prefs();
+    }
+    let mut pct = (app.prefs.sound_volume.clamp(0.0, 1.0) * 100.0).round();
+    let r = ui
+        .scope(|ui| {
+            ui.spacing_mut().slider_width = VOLUME_W;
+            ui.add_enabled(!muted, egui::Slider::new(&mut pct, 0.0..=100.0).step_by(1.0).show_value(false).trailing_fill(true))
+        })
+        .inner
+        .named(tr!("Playback volume"));
+    let r = r.on_hover_text(tr!("Playback volume: {pct} %", pct = pct));
+    if r.changed() {
+        // Heard at once while dragging; written to the preferences when the drag ends.
+        app.prefs.sound_volume = pct / 100.0;
+        if !r.dragged() {
+            app.save_prefs();
+        }
+    }
+    if r.drag_stopped() {
+        app.save_prefs();
+    }
+}
+
+/// The header's volume slider, in points: short, as the header is full.
+const VOLUME_W: f32 = 56.0;
 
 /// The timeline header's tools, beside the dock's tabs (ADR 0075): transport, readouts, frame
 /// and tween buttons, `width` wide at most. What doesn't fit scrolls sideways (Shift+wheel) in
@@ -354,7 +392,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let painter = ui.painter_at(body);
     painter.rect_filled(body, 0.0, T.panel);
 
-    let grid = Rect::from_min_max(pos2(body.left() + LAYER_W, body.top()), body.right_bottom());
+    // In a narrow dock (ADR 0087) the layer column gives up width to keep a strip of frames;
+    // the layers' toggles stay whole and their names are cut short.
+    let layer_w = LAYER_W.min(body.width() - MIN_FRAMES_W).max(MIN_LAYER_W);
+    let grid = Rect::from_min_max(pos2(body.left() + layer_w, body.top()), body.right_bottom());
     let frames_total = app.s.frame_count();
     app.tl_cell_w = app.tl_cell_w.clamp(*CELL_RANGE.start(), *CELL_RANGE.end());
     // Ctrl+wheel (or pinch) over the frames zooms about the pointer: the frame under it stays put.
@@ -756,6 +797,19 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             }
             for id in ["layer.rename", "layer.new", "layer.new_folder", "layer.delete"] {
                 menus::cmd_item(app, ui, id);
+            }
+            ui.separator();
+            if ui.button(tr!("Duplicate Layer")).clicked() {
+                app.run("layer.duplicate", json!({"layer": layer.id.0}));
+                ui.close();
+            }
+            if ui.button(tr!("Copy Layer")).clicked() {
+                app.run("layer.copy", json!({"layer": layer.id.0}));
+                ui.close();
+            }
+            if ui.add_enabled(app.s.layer_clipboard.is_some(), egui::Button::new(tr!("Paste Layer"))).clicked() {
+                app.run("layer.paste", json!({"layer": layer.id.0}));
+                ui.close();
             }
             ui.separator();
             for id in ["layer.toggle_visible", "layer.toggle_lock", "layer.toggle_outline"] {
@@ -1386,6 +1440,17 @@ fn frame_view_button(app: &mut App, ui: &mut egui::Ui) {
             }
         }
         ui.separator();
+        if app.s.editing.is_empty() {
+            ui.label("Scene duration (frames; 0 = auto)");
+            let current = app.s.doc.scenes.get(app.s.scene).map_or(0, |s| s.duration_frames);
+            let mut duration = current;
+            if ui.add(egui::DragValue::new(&mut duration).range(0..=anicraft_engine::MAX_FRAME)).changed() {
+                if let Err(error) = app.s.execute("scene.set_duration", &serde_json::json!({"frames": duration})) {
+                    app.status_err(error.to_string());
+                }
+            }
+            ui.separator();
+        }
         if menus::check_item(ui, tr!("Short"), app.prefs.timeline_short_rows, true) {
             let mut p = app.prefs.clone();
             p.timeline_short_rows = !p.timeline_short_rows;

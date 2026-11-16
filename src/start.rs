@@ -103,6 +103,9 @@ fn header(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.vertical(|ui| {
             ui.label(text(Type::Title, "AniCraft")); // i18n-exempt: the product name
             ui.label(text(Type::Caption, tr!("Version {version} · {stage}", version = env!("CARGO_PKG_VERSION"), stage = crate::i18n::t(crate::app::RELEASE_STAGE))));
+            if let Some(stamp) = option_env!("ANICRAFT_BUILD_TIMESTAMP") {
+                ui.label(text(Type::Caption, tr!("Built {timestamp}", timestamp = stamp.replace('T', " "))));
+            }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let back = ui.add(egui::Button::new(tr!("Back to the document")).shortcut_text(text(Type::Key, "Esc"))); // i18n-exempt: a key name

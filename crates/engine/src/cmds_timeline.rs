@@ -20,7 +20,7 @@ pub fn specs() -> Vec<CommandSpec> {
         c("timeline.create_tween", "Create Classic Tween", "Insert", None, "{layer?, frame?, easing? (as timeline.set_easing takes it)}", true, create_tween),
         c("timeline.create_shape_tween", "Create Shape Tween", "Insert", None, "{layer?, frame?, easing? (as timeline.set_easing takes it)}", true, create_shape_tween),
         c("timeline.remove_tween", "Remove Tween", "Insert", None, "{layer?, frame?} (a motion tween leaves its object as it is on the first frame)", true, remove_tween),
-        c("timeline.set_easing", "Set Tween Easing", "", None, "{easing: a preset name (Linear, QuadIn … ElasticInOut) | {classic: -100..100} | {bezier: [x1, y1, x2, y2]} | {custom: {points: [..]} | [[x, y], ..]} | {saved: name}, group?: all|position|rotation|scale|color|filters (classic tweens: that property group's own ease), layer?, frame?}", true, set_easing),
+        c("timeline.set_easing", "Set Tween Easing", "", None, "{easing: a preset name (Linear, QuadIn … ElasticInOut) | {classic: -100..100} | {bezier: [x1, y1, x2, y2]} | {custom: {points: [..]} | [[x, y], ..]} | {saved: name} | {plugin: id, ease: id} (an ease plug-in's; the tween keeps its sampled curve), group?: all|position|rotation|scale|color|filters (classic tweens: that property group's own ease), layer?, frame?}", true, set_easing),
         c("timeline.set_orient", "Orient to Path", "", None, "{orient: bool, layer?, frame?}", true, set_orient),
         c("timeline.set_label", "Frame Label", "", None, "{label, layer?, frame?}", true, set_label),
         c("timeline.goto", "Go to Frame", "", None, "{frame}", false, goto),
@@ -37,6 +37,9 @@ pub fn specs() -> Vec<CommandSpec> {
         }),
         c("layer.new", "New Layer", "Insert/Timeline", None, "{name?}", true, new_layer),
         c("layer.new_folder", "New Folder", "Insert/Timeline", None, "{name?}", true, new_folder),
+        c("layer.duplicate", "Duplicate Layer", "", None, "{layer?}: duplicate a full layer or folder subtree immediately above the selected layer", true, duplicate_layer),
+        c("layer.copy", "Copy Layer", "", None, "{layer?}: copy a layer and any descendants to the layer clipboard", false, copy_layer),
+        c("layer.paste", "Paste Layer", "", None, "{layer?}: paste copied layers immediately above the target layer; keeps keyframes and hierarchy", true, paste_layer_tree),
         c("layer.delete", "Delete Layer", "Modify/Timeline", None, "{layer? (a folder goes with its contents)}", true, delete_layer),
         c("layer.rename", "Rename Layer", "", None, "{name, layer?}", true, rename_layer),
         c("layer.toggle_visible", "Show/Hide Layer", "", None, "{layer?}", true, |s, p| toggle(s, p, |l| l.visible = !l.visible)),
@@ -677,7 +680,7 @@ fn create_shape_tween(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn tween_of_kind(s: &mut Session, p: &Value, kind: TweenKind) -> Result<Value> {
-    let given = opt_easing_in(&s.doc, p, "easing")?;
+    let given = opt_easing_in(s, p, "easing")?;
     let k = keyframe_mut(s, p)?;
     // Switching kinds keeps the easing the span already had, unless one is given; a classic
     // tween keeps its property groups' eases (a shape tween has one ease, as in Animate).
@@ -705,7 +708,7 @@ fn remove_tween(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn set_easing(s: &mut Session, p: &Value) -> Result<Value> {
-    let easing = opt_easing_in(&s.doc, p, "easing")?.ok_or_else(|| EngineError::Param("param 'easing' is required".into()))?;
+    let easing = opt_easing_in(s, p, "easing")?.ok_or_else(|| EngineError::Param("param 'easing' is required".into()))?;
     let group = crate::cmds_ease::group(p)?;
     let k = keyframe_mut(s, p)?;
     let t = k.tween.as_mut().ok_or_else(|| EngineError::State("this span has no tween; create one first".into()))?;
@@ -736,6 +739,77 @@ fn step(s: &mut Session, d: i64) -> Result<Value> {
     let f = (i64::from(s.frame) + d).rem_euclid(n);
     s.set_frame(f as u32);
     Ok(json!({"frame": s.frame}))
+}
+
+/// One layer or an entire containing folder/mask/guide subtree as a snapshot.
+#[derive(Clone, Debug)]
+pub struct LayerClipboard {
+    pub layers: Vec<Arc<Layer>>,
+}
+
+/// Choose the exact layer (not only the current UI selection) and its descendants.
+fn captured_layers(s: &Session, id: LayerId) -> Result<Vec<Arc<Layer>>> {
+    let tl = s.timeline();
+    let i = tl.layers.iter().position(|layer| layer.id == id)
+        .ok_or_else(|| EngineError::State(format!("no layer with id {}", id.0)))?;
+    let range = tl.group_range(i);
+    Ok(tl.layers.get(range).unwrap_or(&[]).to_vec())
+}
+
+fn copy_layer(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = opt_u64(p, "layer")?.map_or(s.layer, LayerId);
+    let layers = captured_layers(s, id)?;
+    let count = layers.len();
+    s.layer_clipboard = Some(LayerClipboard { layers });
+    Ok(json!({"copied": count}))
+}
+
+/// Paste a snapshot using fresh IDs, remapping frame tween targets, armature joints and
+/// the nested layer tree. All operations are a single undoable engine command.
+fn insert_layer_tree(s: &mut Session, source: Vec<Arc<Layer>>, target: LayerId) -> Result<Value> {
+    let tl = s.timeline();
+    let at = tl.layers.iter().position(|l| l.id == target)
+        .ok_or_else(|| EngineError::State("the target layer no longer exists".into()))?;
+    if source.is_empty() { return Err(EngineError::State("the layer clipboard is empty".into())); }
+    if source.iter().any(|l| l.kind == LayerKind::Camera) {
+        return Err(EngineError::State("a camera layer is unique; it cannot be duplicated or pasted".into()));
+    }
+    if tl.layers.len() + source.len() > 1000 {
+        return Err(EngineError::State("too many layers (limit 1000)".into()));
+    }
+    let parent = tl.layers.get(at).and_then(|l| l.parent);
+    let used: Vec<String> = tl.layers.iter().filter(|l| l.parent == parent).map(|l| l.name.clone()).collect();
+    let source_name = source.first().map_or("Layer", |l| l.name.as_str());
+    let base = format!("{source_name} copy");
+    let name = if !used.contains(&base) { base.clone() } else {
+        (2..=1001).map(|n| format!("{base} {n}")).find(|n| !used.contains(n)).unwrap_or(base)
+    };
+    let mut cloned = crate::cmds_scene::reid(s, &anicraft_doc::Timeline { layers: source }).layers;
+    let new_id = cloned.first().map_or(LayerId(0), |l| l.id);
+    if let Some(root) = cloned.first_mut() {
+        let first = Arc::make_mut(root);
+        first.name = name;
+        first.parent = parent;
+    }
+    let count = cloned.len();
+    let tl = crate::editing::edited_mut(&mut s.doc, s.scene, &s.editing)?;
+    tl.layers.splice(at..at, cloned);
+    tl.repair_masks();
+    s.layer = new_id;
+    s.selection.clear();
+    Ok(json!({"layer": new_id.0, "layers": count}))
+}
+
+fn duplicate_layer(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = opt_u64(p, "layer")?.map_or(s.layer, LayerId);
+    let layers = captured_layers(s, id)?;
+    insert_layer_tree(s, layers, id)
+}
+
+fn paste_layer_tree(s: &mut Session, p: &Value) -> Result<Value> {
+    let target = opt_u64(p, "layer")?.map_or(s.layer, LayerId);
+    let source = s.layer_clipboard.as_ref().ok_or_else(|| EngineError::State("copy a layer first".into()))?.layers.clone();
+    insert_layer_tree(s, source, target)
 }
 
 pub(crate) fn new_layer(s: &mut Session, p: &Value) -> Result<Value> {

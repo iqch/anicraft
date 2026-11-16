@@ -11,11 +11,12 @@ use crate::app::App;
 use crate::icons::{self, Icon};
 use crate::theme::{T, TARGET, Type, color, font, text};
 use anicraft_engine::StateId;
-use anicraft_engine::doc::{LayerKind, SymbolKind};
+use anicraft_engine::doc::{LayerId, LayerKind, SymbolKind, Timeline};
 use anicraft_engine::explorer::{self, NodeKind, Options, Row, Show, Tree};
 use anicraft_engine::find::Scope;
 use egui::{Key, Rect, Sense, Stroke, StrokeKind, WidgetType, pos2, vec2};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// What the Movie Explorer shows and holds between frames (view state).
@@ -30,9 +31,29 @@ pub struct ExplorerView {
     pub expanded: Option<HashSet<String>>,
     /// The selected row, by key.
     pub selected: Option<String>,
+    /// Independent text editor windows; their buffers survive dock/tab changes.
+    editors: BTreeMap<EditorKey, NoteEditor>,
+    /// One engine undo step for a continuous text-editing session.
+    note_gesture: bool,
     /// Bumped when anything above changes, so the tree is made again.
     rev: u64,
     cache: Option<((StateId, usize, u64), Arc<Tree>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum EditorKey {
+    Scene(usize),
+    Layer(u64),
+}
+
+#[derive(Clone, Debug)]
+struct NoteEditor {
+    title: String,
+    text: String,
+    scene: usize,
+    scene_name: String,
+    layer: Option<u64>,
+    open: bool,
 }
 
 /// The Show menu's kinds, kept as the engine's [`Show`] (all on to start).
@@ -169,11 +190,161 @@ fn marker(p: &egui::Painter, at: Rect, k: NodeKind, c: egui::Color32) {
     }
 }
 
+/// Display path of a real document layer, including containing folders.
+fn layer_path(tl: &Timeline, id: LayerId) -> String {
+    let mut names = Vec::new();
+    let mut current = Some(id);
+    for _ in 0..=anicraft_engine::doc::MAX_LAYER_DEPTH {
+        let Some(layer) = current.and_then(|key| tl.layer(key)) else { break };
+        names.push(layer.name.clone());
+        current = layer.parent;
+    }
+    names.reverse();
+    names.join(".")
+}
+
+fn editor_for_row(app: &App, row: &Row) -> Option<(EditorKey, NoteEditor)> {
+    let scene_index = row.go.scene?;
+    let scene = app.s.doc.scenes.get(scene_index)?;
+    match row.kind {
+        NodeKind::Scene => Some((EditorKey::Scene(scene_index), NoteEditor {
+            title: scene.name.clone(),
+            text: scene.description.clone(),
+            scene: scene_index,
+            scene_name: scene.name.clone(),
+            layer: None,
+            open: true,
+        })),
+        NodeKind::Layer(_) if row.go.symbol.is_none() && row.go.path.is_empty() => {
+            let id = row.go.layer?;
+            let layer = scene.timeline.layer(id)?;
+            Some((EditorKey::Layer(id.0), NoteEditor {
+                title: format!("{}.{}", scene.name, layer_path(&scene.timeline, id)),
+                text: layer.description.clone(),
+                scene: scene_index,
+                scene_name: scene.name.clone(),
+                layer: Some(id.0),
+                open: true,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Close editors when the application replaces the current document.
+pub fn reset_editors(app: &mut App) {
+    if app.explorer.note_gesture && app.s.in_gesture() { app.s.end_gesture(); }
+    app.explorer.note_gesture = false;
+    app.explorer.editors.clear();
+}
+
+/// Separate floating editor for every scene/layer selected in Movie Explorer.
+/// egui's multiline TextEdit supplies standard Undo, Cut, Copy and Paste shortcuts.
+pub fn editor_windows(app: &mut App, ctx: &egui::Context) {
+    let mut edits = Vec::new();
+    let mut text_focused = false;
+    for (key, editor) in &mut app.explorer.editors {
+        if app.s.doc.scenes.get(editor.scene).is_none_or(|scene| scene.name != editor.scene_name || editor.layer.is_some_and(|id| scene.timeline.layer(LayerId(id)).is_none())) {
+            editor.open = false;
+            continue;
+        }
+        let title = editor.title.clone();
+        let mut changed = false;
+        egui::Window::new(format!("Description: {title}"))
+            .id(egui::Id::new(("movie_explorer_description", key)))
+            .default_width(470.0)
+            .default_height(290.0)
+            .resizable(true)
+            .open(&mut editor.open)
+            .show(ctx, |ui| {
+                ui.label(text(Type::Caption, title.as_str()));
+                let response = ui.add_sized([ui.available_width().max(280.0), ui.available_height().max(170.0) - 22.0],
+                    egui::TextEdit::multiline(&mut editor.text).desired_rows(12));
+                changed = response.changed();
+                text_focused |= response.has_focus();
+                response.on_hover_text(tr!("Description is saved immediately. Undo / Cut / Copy / Paste: Ctrl+Z / Ctrl+X / Ctrl+C / Ctrl+V."));
+            });
+        if changed {
+            edits.push((editor.scene, editor.layer, editor.text.clone()));
+        }
+    }
+    app.explorer.editors.retain(|_, editor| editor.open);
+    if !edits.is_empty() && !app.explorer.note_gesture && !app.s.in_gesture() {
+        app.s.begin_gesture("Edit Description");
+        app.explorer.note_gesture = true;
+    }
+    for (scene, layer, text) in edits {
+        let mut params = json!({"scene": scene, "text": text});
+        if let Some(id) = layer { params["layer"] = json!(id); }
+        app.run("description.set", params);
+    }
+    if !text_focused && app.explorer.note_gesture {
+        app.s.end_gesture();
+        app.explorer.note_gesture = false;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn export_json(app: &mut App) {
+    let Some(data) = app.run("description.export", json!({})) else { return };
+    let Some(path) = rfd::FileDialog::new().set_title("Export scene and layer descriptions").add_filter("JSON", &["json"]).set_file_name("scene-descriptions.json").save_file() else { return };
+    match serde_json::to_string_pretty(&data).map_err(|e| e.to_string()).and_then(|s| std::fs::write(&path, s).map_err(|e| e.to_string())) {
+        Ok(()) => app.status_ok(format!("Descriptions saved: {}", path.display())),
+        Err(e) => app.status_err(format!("Could not export descriptions: {e}")),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn import_json(app: &mut App) {
+    let Some(path) = rfd::FileDialog::new().set_title("Merge scene and layer descriptions").add_filter("JSON", &["json"]).pick_file() else { return };
+    let result = std::fs::metadata(&path).map_err(|e| e.to_string()).and_then(|meta| {
+        if meta.len() > 64 * 1024 * 1024 { Err("JSON description file exceeds 64 MiB".into()) }
+        else { std::fs::read_to_string(&path).map_err(|e| e.to_string()) }
+    }).and_then(|content| serde_json::from_str::<Value>(&content).map_err(|e| e.to_string()));
+    match result {
+        Ok(data) => {
+            if let Some(summary) = app.run("description.merge", data) {
+                let scenes = summary.get("scenesAdded").and_then(Value::as_u64).unwrap_or(0);
+                let layers = summary.get("layersAdded").and_then(Value::as_u64).unwrap_or(0);
+                app.status_ok(format!("Descriptions merged: {scenes} scenes, {layers} layers added"));
+                app.explorer.changed();
+            }
+        }
+        Err(e) => app.status_err(format!("Could not read descriptions: {e}")),
+    }
+}
+
+/// Compact JSON action with a fixed hit target; optional ANICRAFT_ASSETS icon
+/// overrides the bundled one. The tooltip identifies it without spending header width.
+#[cfg(not(target_arch = "wasm32"))]
+fn json_icon_button(ui: &mut egui::Ui, name: &str, fallback: Icon, tooltip: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(vec2(25.0, 25.0), Sense::click());
+    let response = response.on_hover_text(tooltip);
+    if response.hovered() { ui.painter().rect_filled(rect, T.rc(), T.hover); }
+    let glyph = rect.shrink(4.0);
+    #[cfg(feature = "python")]
+    let loaded = crate::python::paint_named_icon(ui, glyph, name);
+    #[cfg(not(feature = "python"))]
+    let loaded = false;
+    if !loaded { icons::paint(ui.painter(), glyph, fallback, if response.hovered() { T.icon_hot } else { T.icon }); }
+    response.clicked()
+}
+
 pub fn panel(app: &mut App, ui: &mut egui::Ui) {
-    // The search, and the Show menu: kinds of rows, which scenes, the Library's symbols.
+    // The search, display options and two non-destructive JSON actions.
+    let mut do_export = false;
+    let mut do_import = false;
     ui.horizontal(|ui| {
-        let menu_w = 72.0;
-        let search = ui.add(egui::TextEdit::singleline(&mut app.explorer.filter).hint_text(tr!("Search")).desired_width((ui.available_width() - menu_w).max(80.0)));
+        // Reserve room for the Show menu and our two JSON action buttons.
+        let menu_w_id = ui.id().with("explorer_show_w");
+        let menu_w = ui.data(|d| d.get_temp::<f32>(menu_w_id)).unwrap_or(72.0) + ui.spacing().item_spacing.x;
+        let json_buttons_w = if cfg!(target_arch = "wasm32") { 0.0 } else { 2.0 * (25.0 + ui.spacing().item_spacing.x) };
+
+        let search = ui.add(
+            egui::TextEdit::singleline(&mut app.explorer.filter)
+                .hint_text(tr!("Search"))
+                .desired_width((ui.available_width() - menu_w - json_buttons_w).max(crate::theme::MIN_FIELD))
+        );
         search.set_name(tr!("Search the Movie Explorer"));
         if search.changed() {
             app.explorer.changed();
@@ -203,8 +374,25 @@ pub fn panel(app: &mut App, ui: &mut egui::Ui) {
                 app.explorer.changed();
             }
         });
+        let w = menu.response.rect.width();
+        if ui.data(|d| d.get_temp::<f32>(menu_w_id)) != Some(w) {
+            ui.data_mut(|d| d.insert_temp(menu_w_id, w));
+            ui.ctx().request_discard("the Show button's width changed"); // i18n-exempt: a debug reason, never shown
+        }
         menu.response.on_hover_text(tr!("What the Movie Explorer shows")).set_name(tr!("Show in the Movie Explorer"));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            do_export = json_icon_button(ui, "save_json", Icon::SaveJson, "Save descriptions and scene/layer hierarchy as JSON");
+            do_import = json_icon_button(ui, "load_json", Icon::LoadJson, "Merge descriptions and missing scenes/layers from JSON");
+        }
     });
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if do_export { export_json(app); }
+        if do_import { import_json(app); }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (do_export, do_import);
     ui.add_space(4.0);
     let t = tree(app);
     if t.rows.is_empty() {
@@ -221,6 +409,7 @@ fn list(app: &mut App, ui: &mut egui::Ui, t: &Tree) {
     let mut toggle: Option<String> = None;
     let mut select: Option<String> = None;
     let mut go: Option<usize> = None;
+    let mut edit_windows = Vec::new();
     let room = (ui.available_height() - 8.0).clamp(140.0, 320.0);
     let filtering = !app.explorer.filter.trim().is_empty();
     egui::ScrollArea::vertical().id_salt("explorer_rows").max_height(room).auto_shrink([false, true]).show_rows(ui, TARGET, t.rows.len(), |ui, range| {
@@ -243,7 +432,20 @@ fn list(app: &mut App, ui: &mut egui::Ui, t: &Tree) {
             }
             marker(p, icon, r.kind, color(Type::Body));
             let label = row_text(r);
-            let name_rect = Rect::from_min_max(pos2(icon.right() + 8.0, rect.top()), rect.max);
+            let edit_target = editor_for_row(app, r);
+            // Keep the editor inside the visible row and beside its name, not at a
+            // virtual ScrollArea row's far right (which may be clipped away).
+            let edit_rect = Rect::from_center_size(pos2(icon.right() + 13.0, rect.center().y), vec2(23.0, 23.0));
+            let edit_response = edit_target.as_ref().map(|(_, editor)| {
+                let response = ui.interact(edit_rect, ui.id().with(("description.edit", r.key.as_str())), Sense::click());
+                if response.hovered() {
+                    ui.painter().rect_filled(edit_rect, T.rc(), T.hover);
+                }
+                icons::paint(ui.painter(), edit_rect.shrink(5.0), Icon::Pencil, if response.hovered() { T.icon_hot } else { T.icon });
+                response.on_hover_text(editor.title.as_str())
+            });
+            let name_left = if edit_target.is_some() { edit_rect.right() + 4.0 } else { icon.right() + 8.0 };
+            let name_rect = Rect::from_min_max(pos2(name_left, rect.top()), pos2(rect.right().max(name_left), rect.bottom()));
             let g = p.layout_no_wrap(label.clone(), font(Type::Body), color(Type::Body));
             p.with_clip_rect(name_rect.intersect(ui.clip_rect())).galley(pos2(name_rect.left(), rect.center().y - g.rect.height() / 2.0), g, color(Type::Body));
             let kind = crate::i18n::t(kind_name(r.kind));
@@ -254,14 +456,20 @@ fn list(app: &mut App, ui: &mut egui::Ui, t: &Tree) {
             };
             a11y::control(ui, &resp, WidgetType::SelectableLabel, &name, Some(on));
             let resp = resp.on_hover_text(tr!("{row}\nDouble-click to go there", row = name));
-            if resp.clicked() {
+            let clicked_edit = edit_response.as_ref().is_some_and(egui::Response::clicked);
+            if clicked_edit {
+                if let Some(editor) = edit_target {
+                    edit_windows.push(editor);
+                }
+            }
+            if resp.clicked() && !clicked_edit {
                 let on_chevron = ui.input(|inp| inp.pointer.interact_pos()).is_some_and(|q| q.x < icon.left());
                 if on_chevron && r.children && !filtering {
                     toggle = Some(r.key.clone());
                 }
                 select = Some(r.key.clone());
             }
-            if resp.double_clicked() {
+            if resp.double_clicked() && !clicked_edit {
                 go = Some(i);
             }
             if resp.has_focus() && ui.input(|inp| inp.key_pressed(Key::Enter)) {
@@ -269,6 +477,13 @@ fn list(app: &mut App, ui: &mut egui::Ui, t: &Tree) {
             }
         }
     });
+    for (key, editor) in edit_windows {
+        if let Some(existing) = app.explorer.editors.get_mut(&key) {
+            existing.open = true;
+        } else {
+            app.explorer.editors.insert(key, editor);
+        }
+    }
     if let Some(k) = select {
         app.explorer.selected = Some(k);
     }

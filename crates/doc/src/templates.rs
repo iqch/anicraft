@@ -38,7 +38,7 @@ const GUIDE: u32 = 0x4fa3ff;
 const GUIDE_SOFT: u32 = 0x9cc8ff;
 
 fn blank(width: u32, height: u32, fps: f32) -> Document {
-    let mut d = Document { stage: Stage { width, height, fps, background: Rgba::WHITE }, ..Document::default() };
+    let mut d = Document { stage: Stage { width, height, fps, background: Rgba::default_stage_color() }, ..Document::default() };
     d.timeline_mut(0).layers.clear();
     d
 }

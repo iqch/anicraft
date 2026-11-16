@@ -80,16 +80,34 @@ pub enum Icon {
     Plus,
     Trash,
     Copy,
+    SaveJson,
+    LoadJson,
     Ellipsis,
+    PanelProperties,
+    PanelSwatches,
+    PanelLibrary,
+    PanelExplorer,
+    PanelHistory,
+    PanelOutput,
+    PanelActions,
 }
 
 impl Icon {
     #[cfg(test)]
-    pub const ALL: [Icon; 67] = [
+    pub const ALL: [Icon; 76] = [
+        Icon::PanelProperties,
+        Icon::PanelSwatches,
+        Icon::PanelLibrary,
+        Icon::PanelExplorer,
+        Icon::PanelHistory,
+        Icon::PanelOutput,
+        Icon::PanelActions,
         Icon::Warp,
         Icon::Plus,
         Icon::Trash,
         Icon::Copy,
+        Icon::SaveJson,
+        Icon::LoadJson,
         Icon::Ellipsis,
         Icon::ClipStage,
         Icon::InsertFrame,
@@ -256,12 +274,26 @@ impl Icon {
             Icon::Plus => ("plus", false),
             Icon::Trash => ("trash", false),
             Icon::Copy => ("copy", false),
+            Icon::SaveJson => ("save_json", false),
+            Icon::LoadJson => ("load_json", false),
             Icon::Ellipsis => ("ellipsis", false),
+            // The panels, as icons in a dock collapsed to icons (ADR 0087; AniCraft originals,
+            // on Lucide's grid): sliders, swatches, books, a tree, a clock turning back, a
+            // console, code.
+            Icon::PanelProperties => ("anicraft-panel-properties", false),
+            Icon::PanelSwatches => ("anicraft-panel-swatches", false),
+            Icon::PanelLibrary => ("anicraft-panel-library", false),
+            Icon::PanelExplorer => ("anicraft-panel-explorer", false),
+            Icon::PanelHistory => ("anicraft-panel-history", false),
+            Icon::PanelOutput => ("anicraft-panel-output", false),
+            Icon::PanelActions => ("anicraft-panel-actions", false),
         }
     }
 }
 
 static FILES: &[(&str, &str)] = &[
+    ("save_json", include_str!("../assets/icons/save_json.svg")),
+    ("load_json", include_str!("../assets/icons/load_json.svg")),
     ("mouse-pointer-2", include_str!("../assets/icons/mouse-pointer-2.svg")),
     ("navigation", include_str!("../assets/icons/navigation.svg")),
     ("scaling", include_str!("../assets/icons/scaling.svg")),
@@ -327,6 +359,13 @@ static FILES: &[(&str, &str)] = &[
     ("trash", include_str!("../assets/icons/trash.svg")),
     ("copy", include_str!("../assets/icons/copy.svg")),
     ("ellipsis", include_str!("../assets/icons/ellipsis.svg")),
+    ("anicraft-panel-properties", include_str!("../assets/icons/anicraft-panel-properties.svg")),
+    ("anicraft-panel-swatches", include_str!("../assets/icons/anicraft-panel-swatches.svg")),
+    ("anicraft-panel-library", include_str!("../assets/icons/anicraft-panel-library.svg")),
+    ("anicraft-panel-explorer", include_str!("../assets/icons/anicraft-panel-explorer.svg")),
+    ("anicraft-panel-history", include_str!("../assets/icons/anicraft-panel-history.svg")),
+    ("anicraft-panel-output", include_str!("../assets/icons/anicraft-panel-output.svg")),
+    ("anicraft-panel-actions", include_str!("../assets/icons/anicraft-panel-actions.svg")),
 ];
 
 /// The value of attribute `name` in an element's tag text.

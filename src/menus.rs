@@ -12,11 +12,12 @@ pub(crate) const TOP_MENUS: [&str; 9] = [tr_noop!("File"), tr_noop!("Edit"), tr_
 pub fn bar(app: &mut App, ui: &mut egui::Ui) {
     let cmds = commands();
     let ctx = ui.ctx().clone();
+    let top_names = top_names();
     let labels = top_labels();
     let keys = access_keys(&labels.iter().map(String::as_str).collect::<Vec<_>>());
     app.menu_keys.before(&ctx);
     let underline = app.menu_keys.show_keys;
-    let mut tops = Vec::with_capacity(TOP_MENUS.len());
+    let mut tops = Vec::with_capacity(top_names.len());
     egui::MenuBar::new().ui(ui, |ui| {
         // macOS: leave room for the traffic lights over the unified title bar.
         ui.add_space(platform::menu_inset());
@@ -38,8 +39,12 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
             });
         }
         // Windows and Linux: no name before the menus; the window title already shows it.
-        for ((top, label), key) in TOP_MENUS.into_iter().zip(&labels).zip(&keys) {
-            let title = if underline { egui::WidgetText::from(crate::theme::access_key_label(label, key.map(|(i, _)| i))) } else { egui::WidgetText::from(label.as_str()) };
+        for ((top, label), key) in top_names.iter().zip(&labels).zip(&keys) {
+            #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+            let displayed = crate::python::root_label(top, label);
+            #[cfg(not(all(feature = "python", not(target_arch = "wasm32"))))]
+            let displayed = label.clone();
+            let title = if underline { egui::WidgetText::from(crate::theme::access_key_label(&displayed, key.map(|(i, _)| i))) } else { egui::WidgetText::from(displayed.as_str()) };
             let r = ui.menu_button(title, |ui| {
                 ui.set_min_width(230.0);
                 // The menu's own area, which egui leaves anonymous: a menu named by its title.
@@ -47,8 +52,12 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
                     n.set_role(egui::accesskit::Role::Menu);
                     n.set_label(label.as_str());
                 });
-                menu_contents(app, ui, top, &cmds);
+                if TOP_MENUS.contains(&top.as_str()) { menu_contents(app, ui, top, &cmds); }
+                #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+                crate::python::menu_contents(app, ui, top);
             });
+            #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+            crate::python::decorate_root(ui, &r.response, top);
             if let Some((_, c)) = key
                 && MenuKeys::available()
             {
@@ -57,13 +66,30 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
             }
             tops.push(r.response.id);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                crate::remote::button(app, ui);
+            });
+        }
     });
     app.menu_keys.after(&ctx, tops);
 }
 
 /// The top menus' titles in the interface language.
+fn top_names() -> Vec<String> {
+    let mut tops: Vec<String> = TOP_MENUS.iter().map(|s| (*s).to_string()).collect();
+    #[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+    for (title, before) in crate::python::roots() {
+        if tops.contains(&title) { continue; }
+        let at = tops.iter().position(|v| v == &before).unwrap_or(tops.len());
+        tops.insert(at, title);
+    }
+    tops
+}
+
 fn top_labels() -> Vec<String> {
-    TOP_MENUS.iter().map(|t| crate::i18n::t(t).to_string()).collect()
+    top_names().into_iter().map(|name| if TOP_MENUS.contains(&name.as_str()) { crate::i18n::t_dyn(&name).into_owned() } else { name }).collect()
 }
 
 /// Each top menu's access key: `(character index, letter)`, the first letter of its title that
@@ -563,6 +589,10 @@ fn registry_items(app: &mut App, ui: &mut egui::Ui, top: &str, cmds: &[CommandSp
             }
             // View › Snapping also has Snap to Grid and Snap to Guides, where Animate users
             // look for them (ADR 0076); they live in View › Grid and View › Guides too.
+            // Exporter plug-ins' formats, below the built-in ones (ADR 0088).
+            if path == "File/Export" {
+                crate::plugin_export_ui::menu_items(app, ui);
+            }
             if path == "View/Snapping" {
                 for id in ["view.grid_snap", "view.guides_snap"] {
                     cmd_item(app, ui, id);
@@ -664,6 +694,16 @@ pub(crate) fn menu_contents(app: &mut App, ui: &mut egui::Ui, top: &str, cmds: &
             if ui_item(ui, tr!("Loop Playback"), "", Some(app.looping)) {
                 app.looping = !app.looping;
             }
+            // Sound while you work (ADR 0095): the listener's settings, kept in the preferences.
+            ui.separator();
+            if ui_item(ui, tr!("Mute Sounds"), "", Some(app.prefs.sound_muted)) {
+                app.prefs.sound_muted = !app.prefs.sound_muted;
+                app.save_prefs();
+            }
+            if ui_item(ui, tr!("Audio Scrubbing"), "", Some(app.prefs.audio_scrubbing)) {
+                app.prefs.audio_scrubbing = !app.prefs.audio_scrubbing;
+                app.save_prefs();
+            }
         }
         "Window" => {
             // Workspaces (ADR 0075): the built-in ones, yours, Save and Reset.
@@ -679,6 +719,9 @@ pub(crate) fn menu_contents(app: &mut App, ui: &mut egui::Ui, top: &str, cmds: &
                 if ui_item(ui, tr!("Save Workspace…"), "", None) {
                     app.prompt = Some(crate::app::Prompt { title: tr_noop!("Save Workspace"), cmd: "view.save_workspace", key: "name", text: String::new(), focus: true });
                 }
+                if ui_item(ui, tr!("Manage Workspaces…"), "", None) {
+                    crate::workspaces_window::open(app);
+                }
                 let name = crate::i18n::t_dyn(crate::dock::Workspaces::name(&current)).into_owned();
                 if ui_item(ui, &tr!("Reset “{name}”", name = name), "", None) {
                     app.reset_workspace();
@@ -693,8 +736,8 @@ pub(crate) fn menu_contents(app: &mut App, ui: &mut egui::Ui, top: &str, cmds: &
                     crate::dock::Panel::MovieExplorer => app.keymap.primary("view.movie_explorer").unwrap_or(""),
                     _ => "",
                 };
-                if ui_item(ui, crate::i18n::t(p.label()), key, Some(app.dock.is_shown(p))) {
-                    if p == crate::dock::Panel::MovieExplorer && !app.dock.is_shown(p) {
+                if ui_item(ui, crate::i18n::t(p.label()), key, Some(app.panel_visible(p))) {
+                    if p == crate::dock::Panel::MovieExplorer && !app.panel_visible(p) {
                         crate::movie_explorer::open(app);
                     } else {
                         app.toggle_panel(p);

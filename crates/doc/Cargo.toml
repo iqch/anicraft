@@ -8,18 +8,21 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+craft-mime.workspace = true
 anicraft-geom.workspace = true
 serde = { workspace = true, features = ["rc"] }
-# Bitmaps are kept as PNG and decoded on first use.
+
+# Dependencies from our AniCraft implementation
+serde_json.workspace = true
 png.workspace = true
-# Imported JPEGs are decoded and kept as PNG.
 zune-jpeg.workspace = true
+
+# Upstream image codec implementation
+craft-image-codecs.workspace = true
+
 anicraft-audio.workspace = true
 # The timeline action IR keyframes and button instances carry (ADR 0024).
 anicraft-actions.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true

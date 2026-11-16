@@ -598,7 +598,7 @@ pub fn voices(doc: &Document, rate: u32) -> Vec<Voice> {
     let movie_end = frame_start(u64::from(doc.frame_count()), fps, rate);
     let mut lay = Layout { doc, fps, rate, sounding: sounding_symbols(doc), placed: Vec::new(), budget: MAX_STRETCHES };
     for (si, scene) in doc.scenes.iter().enumerate() {
-        let st = Stretch { g0: u64::from(doc.scene_start(si)), l0: 0, n: u64::from(scene.timeline.frame_count()), advancing: true, enters: true, gain: 1.0 };
+        let st = Stretch { g0: u64::from(doc.scene_start(si)), l0: 0, n: u64::from(scene.frame_count()), advancing: true, enters: true, gain: 1.0 };
         lay.timeline(&scene.timeline, st, 0);
     }
     let mut placed = lay.placed;
